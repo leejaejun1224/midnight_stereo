@@ -27,7 +27,8 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from stereo_dpt import DINOv1Base8Backbone, StereoDPTHead, DPTStereoTrainCompat
-from modeljj import StereoModel, assert_multiple
+# from modeljj import StereoModel, assert_multiple
+from modeljj_reassemble import StereoModel, assert_multiple
 from outlier_masking import compute_sky_mask_from_disp
 try:
     import cv2
