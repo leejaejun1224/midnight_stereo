@@ -361,7 +361,7 @@ def main():
     ap.add_argument("--recursive", action="store_true", help="디렉토리 검색 시 하위 폴더까지")
     ap.add_argument("--batch_size", type=int, default=8, help="동일 해상도 이미지 배치 크기")
     ap.add_argument("--alpha", type=float, default=0.4, help="오버레이 투명도(0~1)")
-    ap.add_argument("--quantile", type=float, default=0.8, help="edge로 간주할 상위 quantile (0~1)")
+    ap.add_argument("--quantile", type=float, default=0.98, help="edge로 간주할 상위 quantile (0~1)")
     ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="연산 디바이스")
     ap.add_argument("--prefix", type=str, default="viz", help="파일명 접미사 태그")
 

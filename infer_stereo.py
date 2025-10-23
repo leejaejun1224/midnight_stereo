@@ -28,7 +28,7 @@ from PIL import Image
 from torchvision import transforms
 from stereo_dpt import DINOv1Base8Backbone, StereoDPTHead, DPTStereoTrainCompat
 from modeljj import StereoModel, assert_multiple
-
+from outlier_masking import compute_sky_mask_from_disp
 try:
     import cv2
     HAS_CV2 = True
@@ -463,8 +463,8 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=str, required=True)
-    ap.add_argument("--left", type=str, required=True, help="좌 이미지 파일 또는 디렉터리")
-    ap.add_argument("--right", type=str, required=True, help="우 이미지 파일 또는 디렉터리")
+    ap.add_argument("--left_dir", type=str, required=True, help="좌 이미지 파일 또는 디렉터리")
+    ap.add_argument("--right_dir", type=str, required=True, help="우 이미지 파일 또는 디렉터리")
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--height", type=int, default=384)
     ap.add_argument("--width",  type=int, default=1224)
@@ -499,6 +499,20 @@ def main():
     ap.add_argument("--roi_xyxy", type=str, default="200,300,1000,376", help="입력 해상도 기준 ROI: x1,y1,x2,y2")
     ap.add_argument("--mask_bad_white", action="store_true",
                     help="ROI 내 0/최대 시차 픽셀을 컬러 시차 이미지에서 '흰색'으로 칠함")
+    
+    
+    # Sky mask 저장 옵션
+    ap.add_argument("--save_skymask", action="store_true",
+                    help="near-max disparity 기반 sky 마스크({name}_skymask.png) 저장")
+    ap.add_argument("--sky_thr", type=float, default=3.0,
+                    help="disp >= (max_disp - sky_thr) 를 sky 후보로 간주 (px)")
+    ap.add_argument("--sky_kernel", type=int, default=11,
+                    help="모폴로지 클로징 커널 크기 (odd 권장)")
+    ap.add_argument("--sky_min_area", type=int, default=1,
+                    help="sky 컨투어 최소 면적(픽셀)")
+    ap.add_argument("--sky_vmax_ratio", type=float, default=0.7,
+                    help="컨투어 y_max < H*ratio 여야 sky 인정 (또한 y_min ≤ 1 이어야 함)")
+
 
     args = ap.parse_args()
 
@@ -527,10 +541,10 @@ def main():
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
-    if os.path.isdir(args.left):
-        left_files, right_files = match_files(args.left, args.right)
+    if os.path.isdir(args.left_dir):
+        left_files, right_files = match_files(args.left_dir, args.right_dir)
     else:
-        left_files, right_files = [args.left], [args.right]
+        left_files, right_files = [args.left_dir], [args.right_dir]
 
     for lp, rp in zip(left_files, right_files):
         name = os.path.splitext(os.path.basename(lp))[0]
@@ -573,6 +587,18 @@ def main():
                 alpha=args.overlay_alpha,
                 mask_white=(out["badmask_full"] if args.mask_bad_white else None)
             )
+            
+        if args.save_skymask and HAS_CV2:
+            sky_mask = compute_sky_mask_from_disp(
+                out["disp_px_out"],             # 현재 선택/업샘플 반영된 시차 지도
+                max_disp_px=max_disp_px,
+                thr_px=args.sky_thr,
+                vmax_ratio=args.sky_vmax_ratio,
+                morph_kernel=args.sky_kernel,
+                min_area=args.sky_min_area
+            )
+            if sky_mask is not None:
+                cv2.imwrite(os.path.join(args.out_dir, f"{name}_skymask.png"), sky_mask)
 
         print(f"[OK] {name} -> saved in {args.out_dir} "
               f"(pred_scale={args.pred_scale}, up_to_input={args.upsample_to_input}, "
