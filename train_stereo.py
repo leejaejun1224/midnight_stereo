@@ -764,16 +764,10 @@ def train(args):
 
     photo_crit = PhotometricLoss(weights=[args.photo_l1_w, args.photo_ssim_w])
 
-    sky_crit = SkyZeroLoss(
+    sky_loss = SkyGridZeroLoss(
         max_disp_px=args.max_disp_px,
-        patch_size=args.patch_size,
-        compute_at='half',          # ★ 1/2에서 계산
-        thr_px=3.0, y_max_ratio=0.6,
-        w_huber=1.0, huber_delta_px=0.5,
-        w_ce=0.0,                   # 원하면 0.05 정도로 살짝
-        debug_dir=os.path.join(args.save_dir, "dbg_sky"),  # ★ PNG 저장 폴더
-        save_every=0               # 50 스텝마다 저장 (0이면 매번)
-    ).to(device)
+        patch_size=args.patch_size).to(device)
+
 
 
     optim = build_optimizer([p for p in model.parameters() if p.requires_grad],
@@ -908,16 +902,17 @@ def train(args):
                 loss = loss_dir + loss_photo + loss_smooth
                 # if epoch <= 22: 
                 loss += loss_seed
-                loss_sky, sky_aux = sky_crit(
-                    prob_5d=prob,
-                    disp_soft=disp_soft,
-                    roi_patch=roi_patch,
-                    disp_half_px=aux["disp_half_px"],  # 있으면 그대로 사용
-                    roi_half=roi_half,
-                    names=names,                       # ★ Dataset이 반환한 파일명 리스트
-                    step=(epoch-1)*len(loader)+it      # ★ 전역 step (PNG 파일명에 포함)
+                
+                loss_sky, aux_sky = sky_loss(
+                    refined_logits_masked=aux["refined_masked"],
+                    disp_half_px=aux["disp_half_px"],
+                    roi_half=None,          # ★ 기본은 None 권장
+                    roi_patch=None,         # ★ 기본은 None 권장
+                    names=names,
+                    step=(epoch-1)*len(loader)+it
                 )
                 loss = loss + (args.w_sky * loss_sky)
+                print(loss_sky.item())
 
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -1063,7 +1058,7 @@ def parse_args():
     p.add_argument("--seed_xmax", type=float, default=0.8,
                    help="시드 적용 가로 끝(정규화 0~1, 우측=1)")
 
-    p.add_argument("--w_sky", type=float, default=0.0,
+    p.add_argument("--w_sky", type=float, default=0.05,
                    help="sky weight for SkyZeroLoss")
 
     return p.parse_args()

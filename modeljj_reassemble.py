@@ -59,7 +59,7 @@ class DINOvits8Features(nn.Module):
         super().__init__()
         self.patch = patch_size
         # dino_vits8 로드
-        self.backbone = torch.hub.load("facebookresearch/dino:main", "dino_vits8")
+        self.backbone = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
