@@ -719,9 +719,11 @@ def train(args):
     loader = DataLoader(dataset, batch_size=args.batch_size,
                         shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
 
-    model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size,
-                        agg_base_ch=args.agg_ch, agg_depth=args.agg_depth,
-                        softarg_t=args.softarg_t, norm=args.norm).to(device)
+    # model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size,
+    #                     agg_base_ch=args.agg_ch, agg_depth=args.agg_depth,
+    #                     softarg_t=args.softarg_t, norm=args.norm).to(device)
+    model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size, volume_mode='gwc', gw_groups=8).to(device)
+
     # model = DPTStereoTrainCompat(
     #     max_disp_px=args.max_disp_px,
     #     patch_size=args.patch_size,
@@ -912,7 +914,6 @@ def train(args):
                     step=(epoch-1)*len(loader)+it
                 )
                 loss = loss + (args.w_sky * loss_sky)
-                print(loss_sky.item())
 
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -964,7 +965,7 @@ def parse_args():
     p.add_argument("--mask_dir", type=str, default=None, help="하늘 마스크 폴더(파일명 매칭). 흰색=하늘")
 
     # 모델/학습
-    p.add_argument("--max_disp_px", type=int, default=80)
+    p.add_argument("--max_disp_px", type=int, default=88)
     p.add_argument("--patch_size",  type=int, default=8)
     p.add_argument("--agg_ch",      type=int, default=32)
     p.add_argument("--agg_depth",   type=int, default=3)
@@ -984,7 +985,7 @@ def parse_args():
     p.add_argument("--roi_thr",    type=float, default=0.5)
 
     # 방향 이웃 제약(soft 기준)
-    p.add_argument("--w_dir",        type=float, default=0.1)
+    p.add_argument("--w_dir",        type=float, default=1.0)
     p.add_argument("--sim_thr",      type=float, default=0.8)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)
@@ -1038,7 +1039,7 @@ def parse_args():
     
     
     # --- 1/8 Seeded Prior (핀 + 고무줄) ---
-    p.add_argument("--w_seed", type=float, default=0.02, help="시드 앵커 손실 가중치(작게)")
+    p.add_argument("--w_seed", type=float, default=0.0, help="시드 앵커 손실 가중치(작게)")
     p.add_argument("--seed_low_idx_thr",  type=float, default=1.0)
     p.add_argument("--seed_high_idx_thr", type=float, default=1.0)
     p.add_argument("--seed_conf_thr",     type=float, default=0.05)
@@ -1058,7 +1059,7 @@ def parse_args():
     p.add_argument("--seed_xmax", type=float, default=0.8,
                    help="시드 적용 가로 끝(정규화 0~1, 우측=1)")
 
-    p.add_argument("--w_sky", type=float, default=0.05,
+    p.add_argument("--w_sky", type=float, default=0.0,
                    help="sky weight for SkyZeroLoss")
 
     return p.parse_args()

@@ -26,15 +26,30 @@ def assert_multiple(x, m, name="size"):
         raise ValueError(f"{name}={x} 는 {m}의 배수여야 합니다.")
 
 
-def build_corr_volume_with_mask(FL: torch.Tensor, FR: torch.Tensor, D: int):
+def build_corr_volume_with_mask(FL: torch.Tensor, FR: torch.Tensor, D: int, mode: str = 'gwc', groups: int = 8):
     """
-    Simple sum-correlation volume (cosine-like if FL/FR are L2-normalized along C).
+    Build cost volume between left/right feature maps at 1/patch stride.
+
+    Args:
+        FL, FR : [B,C,H,W]  (assumed channel-normalized)
+        D      : max disparity in feature pixels (inclusive; typically max_disp/patch)
+        mode   : 'sum' (legacy sum correlation -> [B,1,D+1,H,W])
+                 'gwc' (group-wise correlation -> [B,G,D+1,H,W])
+        groups : number of groups when mode == 'gwc'
+
     Returns:
-        vol  : [B,1,D+1,H,W]
-        mask : [B,1,D+1,H,W]  (1.0 for valid, 0.0 for invalid shifts)
+        vol  : [B,Cv,D+1,H,W]  (Cv=1 for 'sum', Cv=groups for 'gwc')
+        mask : [B,1,D+1,H,W]   (1.0 valid, 0.0 invalid)
     """
     B, C, H, W = FL.shape
     vols, masks = [], []
+    if mode not in ['sum', 'gwc']:
+        raise ValueError("mode must be 'sum' or 'gwc'")
+    if mode == 'gwc':
+        assert C % groups == 0, f"C={C} 는 groups={groups}로 나누어 떨어져야 합니다."
+        Cg = C // groups
+        FLg = FL.view(B, groups, Cg, H, W)
+
     for d in range(D + 1):
         if d == 0:
             FR_shift = FR
@@ -43,22 +58,29 @@ def build_corr_volume_with_mask(FL: torch.Tensor, FR: torch.Tensor, D: int):
             FR_shift = F.pad(FR, (d, 0, 0, 0))[:, :, :, :W]
             valid = torch.ones((B, 1, H, W), device=FL.device, dtype=FL.dtype)
             valid[:, :, :, :d] = 0.0
-        corr = (FL * FR_shift).sum(dim=1, keepdim=True)  # [B,1,H,W]
-        vols.append(corr.squeeze(1))
-        masks.append(valid.squeeze(1))
-    vol  = torch.stack(vols,  dim=1).unsqueeze(1)   # [B,1,D+1,H,W]
-    mask = torch.stack(masks, dim=1).unsqueeze(1)   # [B,1,D+1,H,W]
+
+        if mode == 'sum':
+            corr = (FL * FR_shift).sum(dim=1, keepdim=True)  # [B,1,H,W]
+        else:
+            FRg = FR_shift.view(B, groups, Cg, H, W)
+            corr = (FLg * FRg).mean(dim=2)  # [B,G,H,W]
+
+        vols.append(corr)
+        masks.append(valid)
+
+    vol = torch.stack(vols, dim=2)   # [B,Cv,D+1,H,W]; Cv=1 or G
+    mask = torch.stack(masks, dim=2) # [B,1, D+1,H,W]
     return vol, mask
 
 # -----------------------------------------
-# DINO v1 ViT-S/8 feature extractor (tokens->grid baseline)
+# DINO v1 ViT-B/8 feature extractor (tokens->grid baseline)
 # -----------------------------------------
 
 class DINOvits8Features(nn.Module):
     def __init__(self, patch_size: int = 8):
         super().__init__()
         self.patch = patch_size
-        # dino_vits8 로드
+        # dino_vitb8 로드 (torch.hub)
         self.backbone = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
         for p in self.backbone.parameters():
             p.requires_grad = False
@@ -79,7 +101,6 @@ class DINOvits8Features(nn.Module):
 
 # -----------------------------------------
 # Reassemble (extracted from DPT head pre-decoder): tokens -> grid -> 1x1 -> norm+GELU -> resample
-# We keep readout merge to inject [CLS] context, and align to out_stride (default=8 for ViT-S/8).
 # -----------------------------------------
 
 class ReadoutMerge(nn.Module):
@@ -192,96 +213,205 @@ class ReassembleStage(nn.Module):
         return x
 
 # -----------------------------------------
-# 3D U-Net like Aggregation (H/W만 다운)
+# Modernized 3D Aggregation (GWC + Separable 3D UNet + ASPP3D + StripPooling)
 # -----------------------------------------
 
-class Conv3DBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, norm='bn', groups=8):
+class ChannelSE3D(nn.Module):
+    """Squeeze-and-Excitation for 3D tensors (B,C,D,H,W)."""
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1)
-        self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1)
-        if norm == 'gn':
-            self.bn1 = nn.GroupNorm(groups, out_ch)
-            self.bn2 = nn.GroupNorm(groups, out_ch)
-        else:
-            self.bn1 = nn.BatchNorm3d(out_ch)
-            self.bn2 = nn.BatchNorm3d(out_ch)
-        self.relu  = nn.ReLU(inplace=True)
+        hidden = max(channels // reduction, 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid()
+        )
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
+        B, C, D, H, W = x.shape
+        s = x.mean(dim=(2,3,4))                # [B,C]
+        w = self.mlp(s).view(B, C, 1, 1, 1)    # [B,C,1,1,1]
+        return x * w
+
+class SepRes3DBlock(nn.Module):
+    """Depthwise-separable residual 3D block with GroupNorm."""
+    def __init__(self, ch: int, norm='gn', groups_gn: int = 8):
+        super().__init__()
+        self.dw = nn.Conv3d(ch, ch, kernel_size=3, padding=1, groups=ch)
+        self.pw = nn.Conv3d(ch, ch, kernel_size=1)
+        if norm == 'gn':
+            self.bn1 = nn.GroupNorm(num_groups=min(groups_gn, ch), num_channels=ch)
+            self.bn2 = nn.GroupNorm(num_groups=min(groups_gn, ch), num_channels=ch)
+        else:
+            self.bn1 = nn.BatchNorm3d(ch)
+            self.bn2 = nn.BatchNorm3d(ch)
+        self.act = nn.GELU()
+        self.se = ChannelSE3D(ch)
+
+    def forward(self, x):
+        res = x
+        x = self.dw(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.pw(x)
+        x = self.bn2(x)
+        x = self.se(x)
+        x = self.act(x + res)
         return x
 
+class ASPP3D(nn.Module):
+    """Atrous Spatial Pyramid over disparity + spatial dims."""
+    def __init__(self, ch: int, rates: List[Tuple[int,int,int]] = ((1,1,1),(1,2,2),(2,2,2),(3,4,4))):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Conv3d(ch, ch, kernel_size=3, padding=(r[0], r[1], r[2]), dilation=(r[0], r[1], r[2]))
+            for r in rates
+        ])
+        self.merge = nn.Conv3d(ch*len(self.branches), ch, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        feats = [b(x) for b in self.branches]
+        x = torch.cat(feats, dim=1)
+        x = self.merge(x)
+        return self.act(x)
+
+class StripPooling3D(nn.Module):
+    """Capture long-range context along H and W using large-kernel separable convs on each disparity slice."""
+    def __init__(self, ch: int, kh: int = 1, kw: int = 9):
+        super().__init__()
+        # apply conv with kernels (1,1,kw) and (1,kh,1)
+        self.conv_w = nn.Conv3d(ch, ch, kernel_size=(1,1,kw), padding=(0,0,kw//2), groups=ch)
+        self.conv_h = nn.Conv3d(ch, ch, kernel_size=(1,kh,1), padding=(0,kh//2,0), groups=ch)
+        self.pw = nn.Conv3d(ch, ch, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        xw = self.conv_w(x)
+        xh = self.conv_h(x)
+        x = self.pw(xw + xh)
+        return self.act(x)
+
 class Down3D(nn.Module):
-    def __init__(self, in_ch, out_ch, norm='bn', groups=8):
+    def __init__(self, in_ch, out_ch, norm='gn', groups_gn: int = 8):
         super().__init__()
         self.down = nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=(1,2,2), padding=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.bn = nn.GroupNorm(groups, out_ch) if norm=='gn' else nn.BatchNorm3d(out_ch)
+        if norm == 'gn':
+            self.bn = nn.GroupNorm(num_groups=min(groups_gn, out_ch), num_channels=out_ch)
+        else:
+            self.bn = nn.BatchNorm3d(out_ch)
+        self.act = nn.GELU()
     def forward(self, x):
-        return self.relu(self.bn(self.down(x)))
-
+        return self.act(self.bn(self.down(x)))
+    
 class Up3D(nn.Module):
-    def __init__(self, in_ch, out_ch, norm='bn', groups=8):
+    def __init__(self, in_ch, out_ch, norm='gn', groups_gn: int = 8):
         super().__init__()
-        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=3, stride=(1,2,2), padding=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.bn = nn.GroupNorm(groups, out_ch) if norm=='gn' else nn.BatchNorm3d(out_ch)
+        self.up = nn.ConvTranspose3d(
+            in_ch, out_ch, kernel_size=3, stride=(1,2,2), padding=1
+        )
+        if norm == 'gn':
+            self.bn = nn.GroupNorm(num_groups=min(groups_gn, out_ch), num_channels=out_ch)
+        else:
+            self.bn = nn.BatchNorm3d(out_ch)
+        self.act = nn.GELU()
+
     def forward(self, x, out_hw=None):
         if out_hw is not None:
             B, _, D, _, _ = x.shape
-            Ht, Wt = out_hw
+            Ht, Wt = int(out_hw[0]), int(out_hw[1])
             x = self.up(x, output_size=(B, self.up.out_channels, D, Ht, Wt))
         else:
             x = self.up(x)
         x = self.bn(x)
-        x = self.relu(x)
-        return x
+        return self.act(x)
 
-class CostAggregator3D(nn.Module):
-    def __init__(self, base_ch: int = 32, depth: int = 3, norm='bn'):
+
+class GWCAggregator3D(nn.Module):
+    """
+    Input : [B,Cv,D+1,H,W]
+    Output: [B,1,D+1,H,W]
+    """
+    def __init__(self, in_ch: int, base_ch: int = 32, depth: int = 3, norm='gn'):
         super().__init__()
         ch = base_ch
+        self.stem = nn.Conv3d(in_ch, ch, kernel_size=3, padding=1)
+
         # Encoder
-        self.enc1 = Conv3DBlock(1, ch, norm)
-        self.down1 = Down3D(ch, ch*2, norm)
-        self.enc2 = Conv3DBlock(ch*2, ch*2, norm)
-        self.down2 = Down3D(ch*2, ch*4, norm)
-        self.enc3 = Conv3DBlock(ch*4, ch*4, norm)
-        self.down3 = Down3D(ch*4, ch*8, norm) if depth >= 3 else nn.Identity()
-        # Bottleneck
-        if depth >= 3:
-            self.bott = Conv3DBlock(ch*8, ch*8, norm)
-            self.up3  = Up3D(ch*8, ch*4, norm)
-        # Decoder
-        self.dec3 = Conv3DBlock(ch*8 if depth >= 3 else ch*4, ch*4, norm)
-        self.up2  = Up3D(ch*4, ch*2, norm)
-        self.dec2 = Conv3DBlock(ch*4, ch*2, norm)
-        self.up1  = Up3D(ch*2, ch, norm)
-        self.dec1 = Conv3DBlock(ch*2, ch, norm)  # ※ concat 후 2ch → ch
-        self.out  = nn.Conv3d(ch, 1, kernel_size=1)
+        self.e1 = SepRes3DBlock(ch, norm=norm)
+        self.d1 = Down3D(ch, ch*2, norm=norm)
+        self.e2 = SepRes3DBlock(ch*2, norm=norm)
+        self.d2 = Down3D(ch*2, ch*4, norm=norm)
+        self.e3 = SepRes3DBlock(ch*4, norm=norm)
+
         self.depth = depth
+        if depth >= 3:
+            self.d3 = Down3D(ch*4, ch*8, norm=norm)
+            self.b_aspp  = ASPP3D(ch*8)
+            self.b_strip = StripPooling3D(ch*8, kh=9, kw=9)
+            self.b_res   = SepRes3DBlock(ch*8, norm=norm)
+            self.u3      = Up3D(ch*8, ch*4, norm=norm)   # in: ch*8 -> out: ch*4
+
+        # Decoder
+        self.dec3 = SepRes3DBlock(ch*8 if depth >= 3 else ch*4, norm=norm)
+
+        # 🔧 핵심 수정: u2는 dec3 출력 채널(= ch*8 또는 ch*4)을 입력으로 받도록
+        self.u2   = Up3D(ch*8 if depth >= 3 else ch*4, ch*2, norm=norm)  # in: ch*8 → out: ch*2
+
+        self.dec2 = SepRes3DBlock(ch*4, norm=norm)
+
+        # 🔧 핵심 수정: u1은 dec2 출력 채널(= ch*4)을 입력으로 받도록
+        self.u1   = Up3D(ch*4, ch, norm=norm)  # in: ch*4 → out: ch
+
+        # 🔧 핵심 수정: dec1에서 채널을 ch*2 → ch로 축소(그 후 SE/Out)
+        if norm == 'gn':
+            _norm = lambda c: nn.GroupNorm(num_groups=min(8, c), num_channels=c)
+        else:
+            _norm = lambda c: nn.BatchNorm3d(c)
+
+        self.dec1 = nn.Sequential(
+            SepRes3DBlock(ch*2, norm=norm),
+            nn.Conv3d(ch*2, ch, kernel_size=1, bias=False),
+            _norm(ch),
+            nn.GELU()
+        )
+
+        self.se1  = ChannelSE3D(ch)
+        self.out  = nn.Conv3d(ch, 1, kernel_size=1)
 
     def forward(self, x):
-        e1 = self.enc1(x); d1 = self.down1(e1)
-        e2 = self.enc2(d1); d2 = self.down2(e2)
-        e3 = self.enc3(d2)
+        x  = self.stem(x)
+        e1 = self.e1(x); d1 = self.d1(e1)
+        e2 = self.e2(d1); d2 = self.d2(e2)
+        e3 = self.e3(d2)
+
         if self.depth >= 3:
-            d3 = self.down3(e3)
-            b  = self.bott(d3)
-            u3 = self.up3(b, out_hw=(e3.shape[-2], e3.shape[-1]))
-            c3 = torch.cat([u3, e3], dim=1)
+            d3 = self.d3(e3)
+            b  = self.b_aspp(d3)
+            b  = self.b_strip(b)
+            b  = self.b_res(b)
+            u3 = self.u3(b, out_hw=(e3.shape[-2], e3.shape[-1]))
+            c3 = torch.cat([u3, e3], dim=1)  # ch*4 + ch*4 = ch*8
         else:
             c3 = e3
-        dec3 = self.dec3(c3)
-        u2   = self.up2(dec3, out_hw=(e2.shape[-2], e2.shape[-1]))
-        c2   = torch.cat([u2, e2], dim=1)
-        dec2 = self.dec2(c2)
-        u1   = self.up1(dec2, out_hw=(e1.shape[-2], e1.shape[-1]))
-        c1   = torch.cat([u1, e1], dim=1)
-        dec1 = self.dec1(c1)
-        out  = self.out(dec1)   # [B,1,D+1,H',W']
+
+        dec3 = self.dec3(c3)  # ch*8 (또는 ch*4)
+
+        u2   = self.u2(dec3, out_hw=(e2.shape[-2], e2.shape[-1]))  # out: ch*2
+        # 안전가드(디버깅시 유용)
+        # assert u2.shape[-2:] == e2.shape[-2:]
+        c2   = torch.cat([u2, e2], dim=1)                          # ch*2 + ch*2 = ch*4
+
+        dec2 = self.dec2(c2)                                       # ch*4
+        u1   = self.u1(dec2, out_hw=(e1.shape[-2], e1.shape[-1]))  # out: ch
+        # assert u1.shape[-2:] == e1.shape[-2:]
+
+        c1   = torch.cat([u1, e1], dim=1)                          # ch + ch = ch*2
+        dec1 = self.dec1(c1)                                       # → ch
+        dec1 = self.se1(dec1)                                      # ch
+        out  = self.out(dec1)                                      # 1
         return out
+
 
 # -----------------------------------------
 # Soft + ArgMax (둘 다 계산)
@@ -332,7 +462,9 @@ class StereoModel(nn.Module):
                  norm='gn',
                  reassem_ch: int = 192,
                  readout: str = 'project',
-                 reassem_norm: str = 'bn'):
+                 reassem_norm: str = 'bn',
+                 volume_mode: str = 'gwc',   # 'gwc' | 'sum'
+                 gw_groups: int = 8):
         super().__init__()
         self.patch = patch_size
         assert_multiple(max_disp_px, patch_size, "max_disp_px")
@@ -340,17 +472,17 @@ class StereoModel(nn.Module):
             raise ValueError(f"patch_size={self.patch} 는 짝수여야 합니다. (1/8 → 1/2 업샘플에 필요)")
         self.D = max_disp_px // patch_size
 
-        # 1) Load DINO v1 ViT-S/8 (frozen, eval)
+        # 1) Load DINO v1 ViT-B/8 (frozen, eval)
         self.feat_net = DINOvits8Features(patch_size)  # we reuse its backbone
         self.backbone = self.feat_net.backbone
         self.backbone.eval()
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        # DINO embed dim (ViT-S/8 default 384)
-        embed_dim = int(getattr(self.backbone, "embed_dim", 384))
+        # DINO embed dim (ViT-B/8 default 768)
+        embed_dim = int(getattr(self.backbone, "embed_dim", 768))
 
-        # 2) Reassemble (tokens -> 1/8 grid features with Ĉ channels)
+        # 2) Reassemble -> 1/8 features (Ĉ channels)
         self.reassemble = ReassembleStage(
             embed_dim=embed_dim,
             out_channels=reassem_ch,
@@ -361,11 +493,16 @@ class StereoModel(nn.Module):
         )
         self.reassem_ch = reassem_ch
 
-        # 3) 3D aggregator and soft-argmax
-        self.agg = CostAggregator3D(base_ch=agg_base_ch, depth=agg_depth, norm=norm)
+        # 3) Volume mode
+        self.volume_mode = volume_mode
+        self.gw_groups = gw_groups
+        in_ch = gw_groups if volume_mode == 'gwc' else 1
+
+        # 4) 3D aggregator and soft-argmax
+        self.agg = GWCAggregator3D(in_ch=in_ch, base_ch=agg_base_ch, depth=agg_depth, norm=norm)
         self.post = SoftAndArgMax(D=self.D, temperature=softarg_t)
 
-        # 4) Convex upsample head (1/8 → 1/2 == ×(patch/2))
+        # 5) Convex upsample head (1/8 → 1/2 == ×(patch/2))
         self.up_scale = self.patch // 2  # e.g., patch=8 → scale=4
         self.upmask_head = nn.Sequential(
             nn.Conv2d(self.reassem_ch, 128, kernel_size=3, padding=1),
@@ -376,7 +513,7 @@ class StereoModel(nn.Module):
     @torch.no_grad()
     def _get_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Return DINO tokens (B, N+1, D) from ViT-S/8.
+        Return DINO tokens (B, N+1, D) from ViT-B/8.
         """
         tokens = self.backbone.get_intermediate_layers(x, n=1)[0]  # [B, 1+P, D]
         return tokens
@@ -411,13 +548,13 @@ class StereoModel(nn.Module):
         FL = self.reassemble(left_tokens,  image_size=(H, W))  # (B, Ĉ, H/8, W/8)
         FR = self.reassemble(right_tokens, image_size=(H, W))  # (B, Ĉ, H/8, W/8)
 
-        # 3) Normalize channel-wise so sum-corr behaves like cosine
+        # 3) Normalize channel-wise so correlation behaves like cosine
         FL = F.normalize(FL, dim=1, eps=1e-6)
         FR = F.normalize(FR, dim=1, eps=1e-6)
 
         # 4) Correlation volume at 1/8
-        vol, mask = build_corr_volume_with_mask(FL, FR, self.D)
-        vol_in = vol * mask
+        vol, mask = build_corr_volume_with_mask(FL, FR, self.D, mode=self.volume_mode, groups=self.gw_groups)
+        vol_in = vol * mask  # broadcast mask [B,1,D+1,H,W] → [B,Cv,D+1,H,W]
 
         # 5) 3D aggregation
         refined = self.agg(vol_in)          # [B,1,D+1,H',W']
@@ -425,7 +562,10 @@ class StereoModel(nn.Module):
 
         # 6) Prob / soft-arg / WTA at 1/8
         prob, disp_soft, disp_wta = self.post(refined_masked)
-        raw_for_anchor = (vol + (1.0 - mask) * (-1e4)).detach()
+
+        # raw_volume for visualization/anchor (keep legacy shape [B,1,...] using channel-mean if GWC)
+        raw_single = vol.mean(dim=1, keepdim=True) if vol.shape[1] > 1 else vol
+        raw_for_anchor = (raw_single + (1.0 - mask) * (-1e4)).detach()
 
         # 7) Guided convex upsample: 1/8 → 1/2
         upmask = self.upmask_head(FL)  # [B,9*s*s,H',W']
