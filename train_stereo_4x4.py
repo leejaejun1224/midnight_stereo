@@ -569,7 +569,7 @@ def train(args):
         softarg_t=args.softarg_t,
         norm=args.norm,
         sim_fusion_mode="late_weighted",  # ★ semantic 보존
-        dino_weight=0.9,
+        dino_weight=0.8,
         fuse_feat_mode=None,
         cnn_center=True,
         spx_source="dino"
@@ -873,7 +873,7 @@ def parse_args():
 
     # Photometric / Smoothness
     p.add_argument("--w_photo",    type=float, default=1.0)
-    p.add_argument("--w_smooth",   type=float, default=0.01)
+    p.add_argument("--w_smooth",   type=float, default=0.1)
     p.add_argument("--photo_l1_w",   type=float, default=0.15)
     p.add_argument("--photo_ssim_w", type=float, default=0.85)
 

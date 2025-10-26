@@ -1,30 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-학습된 체크포인트로 좌/우 이미지(파일 또는 디렉토리)를 추론해 시차맵 저장.
-
-[동적 격자 인식]
-- 본 스크립트는 모델의 저해상도 시차 지도 크기(H_lo x W_lo)로부터
-  cost volume 격자 다운샘플 비율(cv_down)을 자동 추정합니다.
-  예) 입력 H x W가 384 x 1224, 저해상도 지도가 96 x 306이면 cv_down=4(=1/4 격자)
-      저해상도 지도가 48 x 153이면 cv_down=8(=1/8 격자)
+학습된 체크포인트로 좌/우 이미지(파일 또는 디렉토리)를 추론해 '원본 크기(HxW)' 시차맵 저장.
 
 출력(.npy):
 - *_disp_patch.npy     : 저해상도 격자(WTA) 시차 (H/cv_down x W/cv_down), 단위=grid step
-                         (이전 이름을 유지했으나, 이제 "patch"가 아닌 "grid step" 단위입니다.)
 - *_disp_px_lo.npy     : full-res px 단위 시차, 저해상도 격자 (disp_grid * cv_down)
-- *_disp_px_half.npy   : full-res px 단위 시차, 중간 해상도 격자(보통 H/2, 모델이 제공하면 사용; 없으면 업샘플로 근사)
+- *_disp_px_half.npy   : full-res px 단위 시차, 중간 해상도 격자(보통 H/2)
+- *_disp_px_full.npy   : full-res px 단위 시차, **입력 원본 크기(H x W)** ← photometric loss와 동일 스케일
 
-시각화/저장 대상 선택:
-- --pred_scale {half,lo}로 선택한 시차를 기반으로 다음 옵션 수행
-  - (옵션) 입력 해상도 업샘플(--upsample_to_input)
-  - (옵션) 16bit PNG 저장(--save_uint16)
-  - (옵션) 컬러맵 PNG 저장(--save_color)
-      · 색상 범위 고정: [--color_min, --color_max] 기본 [0,40]
-      · 오른쪽에 세로 컬러바 + 숫자 눈금 표시
-  - (옵션) 원본 좌측 이미지에 반투명 overlay 저장(--save_overlay)
+시각화/저장 대상(항상 원본 크기 사용):
+- --pred_scale {half,lo}로 기준 지도를 고른 뒤, 항상 HxW로 업샘플하여 후처리
+- (옵션) 16bit PNG 저장(--save_uint16)
+- (옵션) 컬러맵 PNG 저장(--save_color)
+    · 색상 범위: [--color_min, --color_max] 기본 [0,40]
+    · 오른쪽 세로 컬러바 + 숫자 눈금
+- (옵션) 원본 좌측 이미지에 반투명 overlay 저장(--save_overlay)
 
 추가(adhoc):
-- --roi_fix 1: 입력 해상도 기준 ROI(x1,y1,x2,y2) 안에서 0/최대 시차를 같은 행의 유효 시차 최빈값 기반으로 치환.
+- --roi_fix 1: 입력 해상도 기준 ROI(x1,y1,x2,y2) 안에서 0/최대 시차를 같은 행 최빈값으로 치환.
 - --mask_bad_white: ROI 안의 0/최대 시차 픽셀을 컬러 시차 이미지에서 '흰색'으로 칠함(별도 저장 없음).
 """
 
@@ -147,7 +140,7 @@ def save_uint16_png(path, disp_px, scale=256.0):
 
 # ---- overlay 저장(여기에 마스킹 반영 추가) ----
 def save_color_and_overlay(left_img_path: str,
-                           disp_px: np.ndarray,
+                           disp_px_full: np.ndarray,
                            out_dir: str,
                            name: str,
                            max_disp_px: int,
@@ -157,6 +150,7 @@ def save_color_and_overlay(left_img_path: str,
                            mask_white: np.ndarray = None):
     """
     overlay 전용(컬러바 없음). mask_white가 주어지면 본체 컬러맵에서 흰색으로 칠함.
+    입력은 '원본 크기(HxW) full‑px' 시차 지도여야 함.
     """
     if not (save_color or save_overlay):
         return
@@ -170,8 +164,7 @@ def save_color_and_overlay(left_img_path: str,
         return
     H0, W0 = img0.shape[:2]
 
-    disp_px_full = cv2.resize(disp_px, (W0, H0), interpolation=cv2.INTER_NEAREST)
-    cm = colorize_disp(disp_px_full, max_disp_px=max_disp_px)  # BGR
+    cm = colorize_disp(disp_px_full, max_disp_px=max_disp_px)  # BGR, (H0,W0)
 
     # --- 흰색 마스킹 반영 ---
     if mask_white is not None:
@@ -449,33 +442,29 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
     if "disp_half_px" in aux:
         disp_half_px_halfunit = aux["disp_half_px"][0, 0].cpu().numpy().astype(np.float32)  # (H_mid, W_mid)
         H_mid, W_mid = disp_half_px_halfunit.shape
-        # half(px) → full(px): 해상도 배율(H/H_mid)을 곱하면 일관되게 full-res px로 정규화됨
+        # half(px) → full(px): 해상도 배율(H/H_mid)을 곱해 full-res px로 정규화
         scale_to_full = float(args.height) / float(H_mid) if H_mid > 0 else 2.0
         disp_px_half = (disp_half_px_halfunit * scale_to_full).astype(np.float32)
     else:
-        # 모델이 중간해상도 px 지도를 제공하지 않는 경우, 저해상도 full‑px 지도를 H/2로 업샘플해 근사 생성
+        # 모델이 중간해상도 px 지도를 제공하지 않으면, 저해상도 full‑px 지도를 H/2로 업샘플해 근사 생성
         H_mid, W_mid = args.height // 2, args.width // 2
         disp_px_half = _resize_np(disp_px_lo, (H_mid, W_mid), mode="nearest").astype(np.float32)
-        warnings.warn("[INFO] aux['disp_half_px']가 없어 저해상도 full‑px 지도를 H/2로 업샘플해 대체합니다.")
+        warnings.warn("[INFO] aux['disp_half_px'] 없음 → 저해상도 full‑px 지도를 H/2로 업샘플해 대체합니다.")
 
-    # --- pred_scale에 따른 base 선택 ---
-    if args.pred_scale == "half":
-        disp_px_base = disp_px_half  # (H/2, W/2) full‑px
-    else:
-        disp_px_base = disp_px_lo    # (H/cv_down, W/cv_down) full‑px
+    # --- 최종: 항상 원본 크기(HxW) full‑px 지도로 출력 ---
+    base = disp_px_half if args.pred_scale == "half" else disp_px_lo
+    base_h = disp_px_half.shape[0] if args.pred_scale == "half" else disp_px_lo.shape[0]
+    base_w = disp_px_half.shape[1] if args.pred_scale == "half" else disp_px_lo.shape[1]
 
-    # --- 필요 시 입력 해상도로 업샘플 ---
-    if args.upsample_to_input:
-        disp_px_out = _resize_np(disp_px_base, (args.height, args.width), mode="nearest").astype(np.float32)
-    else:
-        disp_px_out = disp_px_base
+    interp_mode = "linear" if args.upsample_mode == "linear" else "nearest"
+    disp_px_full = _resize_np(base, (args.height, args.width), mode=interp_mode).astype(np.float32)
 
-    # ---- ROI 보정 및 bad mask 생성 ----
+    # ---- ROI 보정 및 bad mask 생성 (항상 full 해상도에 적용) ----
     badmask_full = None
     x1, y1, x2, y2 = _parse_xyxy(args.roi_xyxy)
     if args.roi_fix:
-        disp_px_out, stats, badmask_full = _row_mode_fill_roi(
-            disp=disp_px_out,
+        disp_px_full, stats, badmask_full = _row_mode_fill_roi(
+            disp=disp_px_full,
             roi_xyxy_in_input=(x1, y1, x2, y2),
             input_size=(args.width, args.height),
             max_disp=max_disp_px,
@@ -485,22 +474,25 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
         print(f"[ROI-FIX/MODE] rect={stats['roi']}  changed={stats['changed']}/{stats['total_bad']}")
     elif args.mask_bad_white:
         badmask_full = _compute_badmask_in_roi(
-            disp=disp_px_out,
+            disp=disp_px_full,
             roi_xyxy_in_input=(x1, y1, x2, y2),
             input_size=(args.width, args.height),
             max_disp=max_disp_px
         )
 
-    # 로그: 동적 격자 정보
+    # 로그: 동적 격자 및 경고
+    if args.upsample_to_input:
+        warnings.warn("--upsample_to_input 옵션은 무시됩니다. (항상 원본 크기로 출력)")
     print(f"[INFO] cv_down={cv_down}  lo_shape={disp_lo_grid.shape}  half_shape={disp_px_half.shape}  "
-          f"pred_base={'half' if args.pred_scale=='half' else 'lo'}  up2input={'Y' if args.upsample_to_input else 'N'}")
+          f"final=({args.height},{args.width})  base={'half' if args.pred_scale=='half' else 'lo'}  "
+          f"interp={interp_mode}")
 
     return {
-        # 주의: 뒤 호환 위해 키 이름 유지
+        # 저장/후처리용
         "disp_patch": disp_lo_grid,            # (H/cv_down, W/cv_down), 단위=grid step
         "disp_px_lo": disp_px_lo,              # (H/cv_down, W/cv_down), 단위=full‑px
         "disp_px_half": disp_px_half,          # (H/2, W/2), 단위=full‑px
-        "disp_px_out": disp_px_out,            # (H_out, W_out), 단위=full‑px
+        "disp_px_full": disp_px_full,          # (H, W),   단위=full‑px  ← 최종
         "badmask_full": badmask_full,
         "max_disp_px": max_disp_px,
         "patch_size": patch_size,              # 백본 요구사항용(1/8 ViT 등)
@@ -518,7 +510,12 @@ def main():
     ap.add_argument("--patch_size", type=int, default=8)
 
     ap.add_argument("--pred_scale", type=str, default="half", choices=["half","lo"])
-    ap.add_argument("--upsample_to_input", action="store_true")
+    # 항상 원본 크기 출력 → 호환성상 옵션 유지하되 무시
+    ap.add_argument("--upsample_to_input", action="store_true",
+                    help="[Deprecated/ignored] 항상 원본 크기로 출력합니다.")
+    ap.add_argument("--upsample_mode", type=str, default="linear", choices=["linear","nearest"],
+                    help="최종 HxW 업샘플 보간 방식(기본 linear)")
+
     ap.add_argument("--save_color", action="store_true")
     ap.add_argument("--save_uint16", action="store_true")
     ap.add_argument("--uint16_scale", type=float, default=256.0)
@@ -548,7 +545,7 @@ def main():
                     help="ROI 내 0/최대 시차 픽셀을 컬러 시차 이미지에서 '흰색'으로 칠함")
     
     
-    # Sky mask 저장 옵션
+    # Sky mask 저장 옵션 (항상 full size에서 계산)
     ap.add_argument("--save_skymask", action="store_true",
                     help="near-max disparity 기반 sky 마스크({name}_skymask.png) 저장")
     ap.add_argument("--sky_thr", type=float, default=3.0,
@@ -602,15 +599,16 @@ def main():
             np.save(os.path.join(args.out_dir, f"{name}_disp_patch.npy"), out["disp_patch"].astype(np.float32))
             np.save(os.path.join(args.out_dir, f"{name}_disp_px_lo.npy"), out["disp_px_lo"].astype(np.float32))
             np.save(os.path.join(args.out_dir, f"{name}_disp_px_half.npy"), out["disp_px_half"].astype(np.float32))
+            np.save(os.path.join(args.out_dir, f"{name}_disp_px_full.npy"), out["disp_px_full"].astype(np.float32))  # NEW
 
-        # 16bit 저장
+        # 16bit 저장 (항상 full size)
         if args.save_uint16:
-            save_uint16_png(os.path.join(args.out_dir, f"{name}_disp16.png"), out["disp_px_out"], scale=args.uint16_scale)
+            save_uint16_png(os.path.join(args.out_dir, f"{name}_disp16.png"), out["disp_px_full"], scale=args.uint16_scale)
 
-        # 컬러맵 PNG (컬러바 포함) — 여기서 흰색 마스킹 반영
+        # 컬러맵 PNG (컬러바 포함) — full size, 흰색 마스킹 반영
         if args.save_color and HAS_CV2:
             cm_with_bar = colorize_with_vertical_bar(
-                out["disp_px_out"],
+                out["disp_px_full"],
                 vmin=args.color_min, vmax=args.color_max,
                 pad=args.colorbar_pad, bar_width=args.colorbar_width, label_width=args.colorbar_label_width,
                 tick_step=args.colorbar_tick_step, tick_count=args.colorbar_tick_count,
@@ -621,11 +619,11 @@ def main():
             if cm_with_bar is not None:
                 cv2.imwrite(os.path.join(args.out_dir, f"{name}_disp_color.png"), cm_with_bar)
 
-        # overlay 저장 (컬러바 없음) — 여기서도 흰색 마스킹 반영
+        # overlay 저장 (컬러바 없음) — full size, 흰색 마스킹 반영
         if args.save_overlay:
             save_color_and_overlay(
                 left_img_path=lp,
-                disp_px=out["disp_px_out"],
+                disp_px_full=out["disp_px_full"],
                 out_dir=args.out_dir,
                 name=name,
                 max_disp_px=max_disp_px,
@@ -634,10 +632,11 @@ def main():
                 alpha=args.overlay_alpha,
                 mask_white=(out["badmask_full"] if args.mask_bad_white else None)
             )
-            
+
+        # sky mask — full size에서 계산
         if args.save_skymask and HAS_CV2:
             sky_mask = compute_sky_mask_from_disp(
-                out["disp_px_out"],             # 현재 선택/업샘플 반영된 시차 지도
+                out["disp_px_full"],            # 항상 입력 크기
                 max_disp_px=max_disp_px,
                 thr_px=args.sky_thr,
                 vmax_ratio=args.sky_vmax_ratio,
@@ -648,7 +647,8 @@ def main():
                 cv2.imwrite(os.path.join(args.out_dir, f"{name}_skymask.png"), sky_mask)
 
         print(f"[OK] {name} -> saved in {args.out_dir} "
-              f"(pred_scale={args.pred_scale}, up_to_input={args.upsample_to_input}, "
+              f"(pred_base={'half' if args.pred_scale=='half' else 'lo'}, "
+              f"final=({args.height},{args.width}), interp={args.upsample_mode}, "
               f"mask_bad_white={'Y' if args.mask_bad_white else 'N'})")
 
 if __name__ == "__main__":
