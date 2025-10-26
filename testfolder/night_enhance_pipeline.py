@@ -315,7 +315,7 @@ def enhance_lowlight_plus(
 def build_parser():
     p = argparse.ArgumentParser(description="Night / Low-light Enhancement (PLUS: detail boost & exposure fusion)")
     p.add_argument("--image", help="Input image path")
-    p.add_argument("--out", help="Output path (default: <name>_enhanced_YYYYmmdd_HHMMSS.png)", default=None)
+    p.add_argument("--out", help="Output path (default: <name>_enhanced_YYYYmmdd_HHMMSS.png)", default="./imglog/enhanced/")
 
     # AWB & Denoise
     p.add_argument("--awb", type=float, default=1.0, help="Gray-world AWB strength [0..1], default=1.0")
@@ -408,7 +408,7 @@ def main():
     )
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = args.out if args.out else basename_with_suffix(args.image, f"enhanced_{ts}")
+    out_path = args.out + basename_with_suffix(args.image, f"enhanced_{ts}")
     cv2.imwrite(out_path, out_img)
     print(f"[+] Saved: {out_path}")
 

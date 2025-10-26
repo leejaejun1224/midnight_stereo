@@ -17,6 +17,10 @@ from torchvision.transforms import InterpolationMode
 from PIL import Image
 from datetime import datetime, timezone, timedelta
 
+# ---------------------------
+# Utils
+# ---------------------------
+
 def assert_multiple(x, m, name="size"):
     if x % m != 0:
         raise ValueError(f"{name}={x} 는 {m}의 배수여야 합니다.")
@@ -40,12 +44,15 @@ def build_corr_volume_with_mask(FL: torch.Tensor, FR: torch.Tensor, D: int):
     mask = torch.stack(masks, dim=1).unsqueeze(1)   # [B,1,D+1,H,W]
     return vol, mask
 
+# ---------------------------
+# DINO v1 ViT-B/8 features (1/8 grid)
+# ---------------------------
+
 class DINOvits8Features(nn.Module):
     def __init__(self, patch_size: int = 8):
         super().__init__()
         self.patch = patch_size
-        # dino_vits8 로드
-        self.backbone = torch.hub.load("facebookresearch/dino:main", "dino_vits8")
+        self.backbone = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
@@ -55,14 +62,13 @@ class DINOvits8Features(nn.Module):
         B, _, H, W = x.shape
         assert_multiple(H, self.patch, "height")
         assert_multiple(W, self.patch, "width")
-        tokens = self.backbone.get_intermediate_layers(x, n=1)[0]  # [B, 1+P, C]
-        patch_tokens = tokens[:, 1:, :]                            # [B, P, C]
+        tokens = self.backbone.get_intermediate_layers(x, n=1)[0]  # [B,1+P,C]
+        patch_tokens = tokens[:, 1:, :]
         C = patch_tokens.shape[-1]
         H8, W8 = H // self.patch, W // self.patch
-        feat = patch_tokens.transpose(1, 2).contiguous().view(B, C, H8, W8)  # [B,C,H',W']
+        feat = patch_tokens.transpose(1, 2).contiguous().view(B, C, H8, W8)  # [B,C,H/8,W/8]
         feat = F.normalize(feat, dim=1, eps=1e-6)
         return feat
-
 
 # ---------------------------
 # 3D U-Net like Aggregation (H/W만 다운)
@@ -156,9 +162,8 @@ class CostAggregator3D(nn.Module):
         out  = self.out(dec1)   # [B,1,D+1,H',W']
         return out
 
-
 # ---------------------------
-# Soft + ArgMax (둘 다 계산)
+# Soft + ArgMax
 # ---------------------------
 
 class SoftAndArgMax(nn.Module):
@@ -172,26 +177,69 @@ class SoftAndArgMax(nn.Module):
         disp_wta  = vol_masked.argmax(dim=2, keepdim=False).float()   # [B,1,H',W']
         return prob, disp_soft, disp_wta
 
+# ---------------------------
+# (참고) 기존 convex 업샘플 함수 (미사용)
+# ---------------------------
+
 def convex_upsample_2d_scalar(disp_lo: torch.Tensor, mask: torch.Tensor, scale: int) -> torch.Tensor:
-    """
-    disp_lo: [B,1,H',W']  (scalar field)
-    mask:    [B, 9*(scale*scale), H', W']
-    return:  [B,1,H'*scale, W'*scale]
-    """
     B, C, H, W = disp_lo.shape
     assert C == 1
-    # mask reshape & softmax over 9 neighbors
     mask = mask.view(B, 1, 9, scale, scale, H, W)
-    mask = torch.softmax(mask, dim=2)  # convex weights over 9
-
-    # unfold 3x3 neighborhood
-    unf = F.unfold(disp_lo, kernel_size=3, padding=1)  # [B, 9, H*W]
-    unf = unf.view(B, 1, 9, H, W).unsqueeze(3).unsqueeze(4)  # [B,1,9,1,1,H,W]
-
-    up = torch.sum(mask * unf, dim=2)  # [B,1,scale,scale,H,W]
+    mask = torch.softmax(mask, dim=2)
+    unf = F.unfold(disp_lo, kernel_size=3, padding=1)
+    unf = unf.view(B, 1, 9, H, W).unsqueeze(3).unsqueeze(4)
+    up = torch.sum(mask * unf, dim=2)
     up = up.permute(0,1,4,2,5,3).contiguous().view(B, 1, H*scale, W*scale)
     return up
 
+# ---------------------------
+# ACVNet-style context upsample (동일 동작)
+# ---------------------------
+
+def context_upsample(depth_low, up_weights):
+    """
+    depth_low: [B,1,h,w]   (여기서는 h=H/8)
+    up_weights: [B,9,4*h,4*w]  (여기서는 [B,9,H/2,W/2])
+    return: [B, H/2, W/2]  (채널 1 생략 형식 그대로 유지)
+    """
+    b, c, h, w = depth_low.shape
+    depth_unfold = F.unfold(depth_low.reshape(b,c,h,w), 3, 1, 1).reshape(b, 9, h, w)
+    depth_unfold = F.interpolate(depth_unfold, (h*4, w*4), mode='nearest').reshape(b, 9, h*4, w*4)
+    depth = (depth_unfold * up_weights).sum(1)
+    return depth
+
+# ---------------------------
+# 2D 유틸 블록 (stem / spx에 사용)
+# ---------------------------
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
+        self.bn   = nn.BatchNorm2d(out_ch)
+        self.act  = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+class SPX2Block(nn.Module):
+    """
+    H/4 특징을 ConvTranspose2d로 H/2로 올리고, stem_2(H/2)와 skip concat 후 3x3로 정리.
+    """
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)  # H/4 -> H/2
+        self.fuse = nn.Sequential(
+            ConvBNReLU(out_ch + skip_ch, out_ch, k=3, s=1, p=1),
+        )
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.fuse(x)
+        return x
+
+# ---------------------------
+# Stereo Model with context_upsample
+# ---------------------------
 
 class StereoModel(nn.Module):
     def __init__(self, max_disp_px: int = 64, patch_size: int = 8,
@@ -204,23 +252,41 @@ class StereoModel(nn.Module):
             raise ValueError(f"patch_size={self.patch} 는 짝수여야 합니다. (1/8 → 1/2 업샘플에 필요)")
         self.D = max_disp_px // patch_size
 
+        # 1) Feature (ViT-B/8, 1/8 grid)
         self.feat_net = DINOvits8Features(patch_size)
-        self.agg = CostAggregator3D(base_ch=agg_base_ch, depth=agg_depth, norm=norm)
+
+        # 2) 3D aggregation + soft-argmax
+        self.agg  = CostAggregator3D(base_ch=agg_base_ch, depth=agg_depth, norm=norm)
         self.post = SoftAndArgMax(D=self.D, temperature=softarg_t)
 
-        # Convex upsample 준비 (1/8 → 1/2 == ×(patch/2))
-        self.up_scale = self.patch // 2  # e.g., patch=8 → scale=4
-        feat_ch = getattr(self.feat_net.backbone, "embed_dim", 384)
-        self.upmask_head = nn.Sequential(
-            nn.Conv2d(feat_ch, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, (9)*(self.up_scale**2), kernel_size=1)
+        # 3) context upsample 준비 (1/8 → 1/2 == ×4)
+        self.up_scale = self.patch // 2  # e.g., patch=8 → 4
+
+        # stem 경로: 입력 이미지에서 저층 피처 (H/2, H/4)
+        self.stem_2 = nn.Sequential(
+            ConvBNReLU(3, 32, k=3, s=2, p=1),             # H → H/2
+            ConvBNReLU(32, 32, k=3, s=1, p=1),
+        )
+        self.stem_4 = nn.Sequential(
+            ConvBNReLU(32, 48, k=3, s=2, p=1),            # H/2 → H/4
+            ConvBNReLU(48, 48, k=3, s=1, p=1),
         )
 
+        feat_ch = getattr(self.feat_net.backbone, "embed_dim", 384)  # ViT-B/8: 768
+        # H/4에서 FL(업샘플)과 stem_4을 결합해 spx 분기 입력 생성
+        self.spx_4 = nn.Sequential(
+            ConvBNReLU(feat_ch + 48, 64, k=3, s=1, p=1)   # [B,64,H/4,W/4]
+        )
+        # H/4 → H/2 업샘플 + stem_2 skip 결합
+        self.spx_2 = SPX2Block(in_ch=64, skip_ch=32, out_ch=64)      # [B,64,H/2,W/2]
+
+        # 최종 업샘플 가중치(3×3=9개) 예측 (H/2, W/2)
+        self.spx_head = nn.Conv2d(64, 9, kernel_size=3, stride=1, padding=1)
+
+    @torch.no_grad()
     def extract_feats(self, left: torch.Tensor, right: torch.Tensor):
-        with torch.no_grad():
-            FL = self.feat_net(left)
-            FR = self.feat_net(right)
+        FL = self.feat_net(left)   # [B,C,H/8,W/8]
+        FR = self.feat_net(right)  # [B,C,H/8,W/8]
         return FL, FR
 
     def forward(self, left: torch.Tensor, right: torch.Tensor):
@@ -235,19 +301,42 @@ class StereoModel(nn.Module):
              disp_half_px: [B,1,H/2,W/2] (단위: half 픽셀)
           )
         """
-        FL, FR = self.extract_feats(left, right)
-        vol, mask = build_corr_volume_with_mask(FL, FR, self.D)
+        B, _, H, W = left.shape
+
+        # 1) features
+        FL, FR = self.extract_feats(left, right)                         # [B,C,H/8,W/8]
+
+        # 2) cost volume + 3D aggregation
+        vol, mask = build_corr_volume_with_mask(FL, FR, self.D)          # [B,1,D+1,H/8,W/8]
         vol_in = vol * mask
-        refined = self.agg(vol_in)          # [B,1,D+1,H',W']
+        refined = self.agg(vol_in)                                       # [B,1,D+1,H/8,W/8]
         refined_masked = refined + (1.0 - mask) * (-1e4)
-        prob, disp_soft, disp_wta = self.post(refined_masked)
+
+        # 3) soft-arg + WTA
+        prob, disp_soft, disp_wta = self.post(refined_masked)            # disp_soft: [B,1,H/8,W/8]
         raw_for_anchor = (vol + (1.0 - mask) * (-1e4)).detach()
 
-        # Convex upsample: 1/8 → 1/2
-        upmask = self.upmask_head(FL)  # [B,9*s*s,H',W']
-        disp_half = convex_upsample_2d_scalar(disp_soft, upmask, self.up_scale)  # patch 단위
-        # half 해상도 '픽셀' 단위 disparity로 변환 (1 patch == patch_size px at fullres == patch_size/2 px at halfres)
-        disp_half_px = disp_half * float(self.patch / 2.0)
+        # 4) context upsample 가중치 예측 (입력 이미지 경로 활용)
+        # stem 저층 피처
+        stem2 = self.stem_2(left)                                        # [B,32,H/2,W/2]
+        stem4 = self.stem_4(stem2)                                       # [B,48,H/4,W/4]
+
+        # FL(1/8)을 H/4로 올려 stem4와 결합 → spx_4
+        FL4 = F.interpolate(FL, size=(H // 4, W // 4), mode='bilinear', align_corners=False)  # [B,C,H/4,W/4]
+        spx4_in = torch.cat([FL4, stem4], dim=1)                         # [B,C+48,H/4,W/4]
+        xspx4 = self.spx_4(spx4_in)                                      # [B,64,H/4,W/4]
+
+        # H/4 → H/2 업샘플(+ stem2 skip)
+        xspx2 = self.spx_2(xspx4, stem2)                                 # [B,64,H/2,W/2]
+
+        # 픽셀당 3×3 가중치 9채널 예측 (softmax로 볼록결합 보장)
+        spx_logits = self.spx_head(xspx2)                                # [B,9,H/2,W/2]
+        spx_pred = F.softmax(spx_logits, dim=1)                          # [B,9,H/2,W/2]
+        # 안정성 체크(선택): assert spx_pred.shape[2:] == (H//2, W//2)
+
+        # 5) ACVNet-style context_upsample: 1/8 → 1/2 (×4)
+        disp_half = context_upsample(disp_soft, spx_pred).unsqueeze(1)   # [B,1,H/2,W/2] (단위: patch)
+        disp_half_px = disp_half * float(self.patch / 2.0)               # half-res 'px' 단위
 
         return prob, disp_soft, {
             "FL": FL, "FR": FR,
@@ -259,4 +348,3 @@ class StereoModel(nn.Module):
             "disp_half": disp_half,
             "disp_half_px": disp_half_px,
         }
-

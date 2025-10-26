@@ -2,7 +2,7 @@ import os
 import glob
 import argparse
 import random
-from typing import Tuple, List, Dict
+from typing import List
 
 import warnings
 import numpy as np
@@ -16,12 +16,14 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from PIL import Image
 from datetime import datetime, timezone, timedelta
+
 # from modeljj import StereoModel
 from modeljj_reassemble import StereoModel
 from stereo_dpt import DINOv1Base8Backbone, StereoDPTHead, DPTStereoTrainCompat
 from prop_utils import *
 from logger import *
 from sky_loss import *
+
 # ---------------------------
 # 유틸
 # ---------------------------
@@ -30,7 +32,6 @@ def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def stem(path: str) -> str:
     s = os.path.splitext(os.path.basename(path))[0]
@@ -49,17 +50,16 @@ def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------
-# 데이터셋 (+ 하늘 마스크)
+# 데이터셋 (mask_dir 제거)
 # ---------------------------
 
 class StereoFolderDataset(Dataset):
     """
     - left_dir/right_dir: 동일 파일명 매칭
-    - mask_dir: 같은 파일명(stem)이 있는 샘플만 사용, 하늘(흰색=255) 제외 마스크 제공
+    - 마스크 관련 입력/처리는 모두 제거되었습니다.
     """
     def __init__(self, left_dir: str, right_dir: str,
-                 height: int = 384, width: int = 1224,
-                 mask_dir: str = None):
+                 height: int = 384, width: int = 1224):
         left_all  = sorted(glob.glob(os.path.join(left_dir,  "*")))
         right_all = sorted(glob.glob(os.path.join(right_dir, "*")))
         assert len(left_all) == len(right_all) and len(left_all) > 0, "좌/우 이미지 수 불일치 또는 비어 있음"
@@ -76,28 +76,9 @@ class StereoFolderDataset(Dataset):
             transforms.Normalize(mean=[0.485,0.456,0.406],
                                  std=[0.229,0.224,0.225]),
         ])
-        self.mask_resize = transforms.Resize((height, width), interpolation=InterpolationMode.NEAREST)
 
-        self.mask_dir = mask_dir
-        self.left_paths: List[str] = []
-        self.right_paths: List[str] = []
-        self.mask_paths: List[str] = []
-
-        if mask_dir is None:
-            self.left_paths  = left_all
-            self.right_paths = right_all
-            self.mask_paths  = [None] * len(self.left_paths)
-        else:
-            mask_all = sorted(glob.glob(os.path.join(mask_dir, "*")))
-            mask_map: Dict[str, str] = {stem(p): p for p in mask_all}
-            for lp, rp in zip(left_all, right_all):
-                st = stem(lp)
-                if st in mask_map:
-                    self.left_paths.append(lp)
-                    self.right_paths.append(rp)
-                    self.mask_paths.append(mask_map[st])
-            if len(self.left_paths) == 0:
-                raise ValueError(f"mask_dir={mask_dir} 에 매칭되는 파일이 없습니다.")
+        self.left_paths:  List[str] = left_all
+        self.right_paths: List[str] = right_all
 
     def __len__(self):
         return len(self.left_paths)
@@ -107,41 +88,8 @@ class StereoFolderDataset(Dataset):
         right_img = Image.open(self.right_paths[idx]).convert("RGB")
         left_t  = self.to_tensor(left_img)
         right_t = self.to_tensor(right_img)
-
-        if self.mask_paths[idx] is None:
-            valid_full = torch.ones(1, self.height, self.width, dtype=torch.float32)
-        else:
-            m = Image.open(self.mask_paths[idx]).convert("L")
-            m = self.mask_resize(m)
-            m_t = transforms.ToTensor()(m)                  # [1,H,W], 0~1
-            valid_full = (1.0 - (m_t >= 0.99).float())      # 하늘=0, 그 외=1
-
-        return left_t, right_t, valid_full, os.path.basename(self.left_paths[idx])
-
-
-def shift_with_mask(x: torch.Tensor, dy: int, dx: int):
-    B, C, H, W = x.shape
-    pt, pb = max(dy,0), max(-dy,0)
-    pl, pr = max(dx,0), max(-dx,0)
-    x_pad = F.pad(x, (pl, pr, pt, pb))
-    x_shift = x_pad[:, :, pb:pb+H, pl:pl+W]
-    valid = torch.ones((B,1,H,W), device=x.device, dtype=x.dtype)
-    if dy > 0:   valid[:, :, :dy, :] = 0
-    if dy < 0:   valid[:, :, H+dy:, :] = 0
-    if dx > 0:   valid[:, :, :, :dx] = 0
-    if dx < 0:   valid[:, :, :, W+dx:] = 0
-    return x_shift, valid
-
-def make_roi_patch(valid_full: torch.Tensor, patch_size: int, method: str = "avg", thr: float = 0.5):
-    B, C, H, W = valid_full.shape
-    assert C == 1
-    H8, W8 = H // patch_size, W // patch_size
-    if method == "nearest":
-        roi = F.interpolate(valid_full, size=(H8, W8), mode="nearest")
-    else:
-        roi = F.avg_pool2d(valid_full, kernel_size=patch_size, stride=patch_size)
-        roi = (roi >= thr).float()
-    return roi
+        name = os.path.basename(self.left_paths[idx])
+        return left_t, right_t, name
 
 
 # ---------------------------
@@ -414,6 +362,19 @@ class CorrAnchorLoss(torch.nn.Module):
             viol = 0.5*(viol**2)*small + (viol - 0.5)*(1-small)
         return (w * viol).sum() / (w.sum() + 1e-6)
 
+def shift_with_mask(x: torch.Tensor, dy: int, dx: int):
+    B, C, H, W = x.shape
+    pt, pb = max(dy,0), max(-dy,0)
+    pl, pr = max(dx,0), max(-dx,0)
+    x_pad = F.pad(x, (pl, pr, pt, pb))
+    x_shift = x_pad[:, :, pb:pb+H, pl:pl+W]
+    valid = torch.ones((B,1,H,W), device=x.device, dtype=x.dtype)
+    if dy > 0:   valid[:, :, :dy, :] = 0
+    if dy < 0:   valid[:, :, H+dy:, :] = 0
+    if dx > 0:   valid[:, :, :, :dx] = 0
+    if dx < 0:   valid[:, :, :, W+dx:] = 0
+    return x_shift, valid
+
 def warp_right_to_left_feat(FR, disp_patch, align_corners=True):
     B, C, H, W = FR.shape
     yy, xx = torch.meshgrid(
@@ -464,8 +425,24 @@ class FeatureReprojLoss(torch.nn.Module):
 
 
 # ---------------------------
-# Photometric / Smoothness (제공 코드 통합)
+# Photometric / Smoothness
 # ---------------------------
+def enhance_batch_bgr_from_rgb01(img_rgb_01: torch.Tensor, 
+                                 enable: bool, gamma: float, 
+                                 clahe_clip: float, clahe_tile: int) -> torch.Tensor: 
+    """ img_rgb_01: [B,3,H,W] in [0,1] return: enhanced RGB [B,3,H,W] in [0,1] """ 
+    B, C, H, W = img_rgb_01.shape 
+    out_list = [] 
+    img_cpu = img_rgb_01.detach().cpu().clamp(0,1).numpy() 
+    for b in range(B): 
+        rgb = (img_cpu[b].transpose(1,2,0) * 255.0).astype(np.uint8) # H,W,3 RGB uint8 
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) 
+        bgr_enh = enhance_low_light_bgr(bgr, enable=enable, gamma=gamma, 
+                                        clahe_clip=clahe_clip, clahe_tile=clahe_tile) 
+        rgb_enh = cv2.cvtColor(bgr_enh, cv2.COLOR_BGR2RGB) 
+        out_list.append(torch.from_numpy(rgb_enh.astype(np.float32) / 255.0).permute(2,0,1)) 
+    out = torch.stack(out_list, dim=0) 
+    return out.to(img_rgb_01.device)
 
 def enhance_low_light_bgr(img_bgr: np.ndarray,
                           enable: bool = True,
@@ -486,8 +463,6 @@ def enhance_low_light_bgr(img_bgr: np.ndarray,
     return img2
 
 class SSIM(nn.Module):
-    """Layer to compute the SSIM loss between a pair of images
-    """
     def __init__(self):
         super(SSIM, self).__init__()
         self.mu_x_pool   = nn.AvgPool2d(3, 1)
@@ -495,26 +470,17 @@ class SSIM(nn.Module):
         self.sig_x_pool  = nn.AvgPool2d(3, 1)
         self.sig_y_pool  = nn.AvgPool2d(3, 1)
         self.sig_xy_pool = nn.AvgPool2d(3, 1)
-
         self.refl = nn.ReflectionPad2d(1)
-
         self.C1 = 0.01 ** 2
         self.C2 = 0.03 ** 2
-
     def forward(self, x, y):
-        x = self.refl(x)
-        y = self.refl(y)
-
-        mu_x = self.mu_x_pool(x)
-        mu_y = self.mu_y_pool(y)
-
+        x = self.refl(x); y = self.refl(y)
+        mu_x = self.mu_x_pool(x); mu_y = self.mu_y_pool(y)
         sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2
         sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2
         sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y
-
         SSIM_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
         SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
-
         return torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
 
 class PhotometricLoss:
@@ -530,36 +496,8 @@ class PhotometricLoss:
             weighted_loss += weights[i] * losses[i]
         return weighted_loss
 
-class MultiScalePhotometricLoss(nn.Module):
-    def __init__(self, full_scale = False):
-        super(MultiScalePhotometricLoss, self).__init__()
-        self.ssim = SSIM()
-        self.full_scale = full_scale
-    def simple_loss(self,original_image, reconstructed_image, weights = [0.15,0.85]):
-        assert original_image.shape == reconstructed_image.shape
-        l1_loss = torch.abs(original_image - reconstructed_image).mean(1,True)
-        ssim_loss = self.ssim(original_image, reconstructed_image).mean(1,True)
-        losses = [l1_loss, ssim_loss]
-        weighted_loss = 0
-        for i in range(len(weights)):
-            weighted_loss += weights[i] * losses[i]
-        return weighted_loss
-    def forward(self, reconstructed_images,original_images, reduce_mean = True):
-        assert len(reconstructed_images) == len(original_images)
-        total_loss = 0.0
-        for original, recon in zip(original_images, reconstructed_images):
-            if self.full_scale:
-                loss = self.simple_loss(original_images[0], recon)
-            else:
-                loss = self.simple_loss(original, recon)
-            total_loss += loss.mean()
-        total_loss = total_loss / len(original_images)
-        return total_loss
-
 def get_disparity_smooth_loss(disp, img):
-    """Computes the smoothness loss for a disparity image
-    The color image is used for edge-aware smoothness
-    """
+    """Edge-aware smoothness for disparity"""
     grad_disp_x = torch.abs(disp[:, :, :, :-1] - disp[:, :, :, 1:])
     grad_disp_y = torch.abs(disp[:, :, :-1, :] - disp[:, :, 1:, :])
 
@@ -571,50 +509,9 @@ def get_disparity_smooth_loss(disp, img):
 
     return grad_disp_x.mean() + grad_disp_y.mean()
 
-def multi_scale_disparity_smooth_loss(multi_scale_disparities,
-                                      multi_scale_images, weight = 1e-3):
-    loss = 0
-    for scale in range(len(multi_scale_disparities)):
-        loss += weight * get_disparity_smooth_loss(
-            multi_scale_disparities[scale], multi_scale_images[scale]
-        )
-    return loss
-
-def enhance_batch_bgr_from_rgb01(img_rgb_01: torch.Tensor,
-                                 enable: bool,
-                                 gamma: float,
-                                 clahe_clip: float,
-                                 clahe_tile: int) -> torch.Tensor:
-    """
-    img_rgb_01: [B,3,H,W] in [0,1]
-    return: enhanced RGB [B,3,H,W] in [0,1]
-    """
-    B, C, H, W = img_rgb_01.shape
-    out_list = []
-    img_cpu = img_rgb_01.detach().cpu().clamp(0,1).numpy()
-    for b in range(B):
-        rgb = (img_cpu[b].transpose(1,2,0) * 255.0).astype(np.uint8)  # H,W,3 RGB uint8
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        bgr_enh = enhance_low_light_bgr(bgr, enable=enable, gamma=gamma,
-                                        clahe_clip=clahe_clip, clahe_tile=clahe_tile)
-        rgb_enh = cv2.cvtColor(bgr_enh, cv2.COLOR_BGR2RGB)
-        out_list.append(torch.from_numpy(rgb_enh.astype(np.float32) / 255.0).permute(2,0,1))
-    out = torch.stack(out_list, dim=0)
-    return out.to(img_rgb_01.device)
-
 
 # ---------------------------
-# Convex Upsample (RAFT-style)
-# ---------------------------
-
-
-
-# ---------------------------
-# 전체 모델
-# ---------------------------
-
-# ---------------------------
-# 옵티마이저 & 체크포인트 유틸
+# 학습 루프
 # ---------------------------
 
 def build_optimizer(params, name='adamw', lr=1e-3, weight_decay=1e-2):
@@ -625,7 +522,6 @@ def build_optimizer(params, name='adamw', lr=1e-3, weight_decay=1e-2):
         return torch.optim.Adam(params, lr=lr, weight_decay=1e-5)
     else:
         return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.98), weight_decay=weight_decay)
-
 
 def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device: torch.device):
     """optimizer state 텐서들을 device로 이동 (CPU ckpt 로드시 안전)"""
@@ -705,33 +601,20 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
     return start_epoch
 
 
-# ---------------------------
-# 학습 루프
-# ---------------------------
-
 def train(args):
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = StereoFolderDataset(args.left_dir, args.right_dir,
-                                  height=args.height, width=args.width,
-                                  mask_dir=args.mask_dir)
+                                  height=args.height, width=args.width)
     loader = DataLoader(dataset, batch_size=args.batch_size,
                         shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
 
-    # model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size,
-    #                     agg_base_ch=args.agg_ch, agg_depth=args.agg_depth,
-    #                     softarg_t=args.softarg_t, norm=args.norm).to(device)
-    model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size, volume_mode='gwc', gw_groups=8).to(device)
+    model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size,
+                        agg_base_ch=args.agg_ch, agg_depth=args.agg_depth,
+                        softarg_t=args.softarg_t, norm=args.norm).to(device)
+    # model = StereoModel(max_disp_px=args.max_disp_px, patch_size=args.patch_size, volume_mode='gwc', gw_groups=8).to(device)
 
-    # model = DPTStereoTrainCompat(
-    #     max_disp_px=args.max_disp_px,
-    #     patch_size=args.patch_size,
-    #     feat_dim=256,            # DPT 내부 채널(필요시 변경 가능)
-    #     readout='project',       # CLS readout 주입 방식
-    #     embed_dim=768,           # DINOv1-B/8
-    #     temperature=0.7          # SoftAndArgMax의 T와 유사
-    # ).to(device)
     # 손실 모듈
     dir_loss_fn = DirectionalRelScaleDispLoss(
         sim_thr=args.sim_thr, sim_gamma=args.sim_gamma, sample_k=args.sim_sample_k,
@@ -763,14 +646,11 @@ def train(args):
         tau=args.seed_tau, huber_delta=args.seed_huber_delta
     ).to(device)
 
-
     photo_crit = PhotometricLoss(weights=[args.photo_l1_w, args.photo_ssim_w])
 
     sky_loss = SkyGridZeroLoss(
         max_disp_px=args.max_disp_px,
         patch_size=args.patch_size).to(device)
-
-
 
     optim = build_optimizer([p for p in model.parameters() if p.requires_grad],
                             name=args.optim, lr=args.lr, weight_decay=args.weight_decay)
@@ -788,28 +668,18 @@ def train(args):
                 args,
                 save_dir=args.save_dir,
                 filename="trainlog.txt",
-                append_if_exists=True,  # 기존 파일 있으면 이어서 기록
+                append_if_exists=True,
                 title="Stereo Training Arguments"
             )
         print(f"[Log] Arguments written to: {log_path}")
-        
         
     model.train()
     
     for epoch in range(start_epoch, args.epochs + 1):
         running = 0.0
-        for it, (imgL, imgR, valid_full, names) in enumerate(loader, start=1):
+        for it, (imgL, imgR, names) in enumerate(loader, start=1):  # ★ valid_full 제거
             imgL = imgL.to(device, non_blocking=True)
             imgR = imgR.to(device, non_blocking=True)
-            valid_full = valid_full.to(device, non_blocking=True)  # [B,1,H,W]
-
-            # ROI (avg-pool 기반 권장)
-            roi_patch = make_roi_patch(valid_full, patch_size=args.patch_size,
-                                       method=args.roi_method, thr=args.roi_thr)
-
-            # Half-scale ROI (photometric에 사용)
-            roi_half = make_roi_patch(valid_full, patch_size=2,
-                                      method=args.roi_method, thr=args.roi_thr)
 
             # photometric용 원본 [0,1] 변환 + 1/2 스케일
             with torch.no_grad():
@@ -835,7 +705,10 @@ def train(args):
 
                 # 1/2 해상도 disparity (픽셀 단위)
                 disp_half_px = aux["disp_half_px"]
-                
+
+                # === ROI 전영역(=1) 처리 ===
+                roi_patch = torch.ones_like(disp_soft)           # [B,1,H/8,W/8]
+                roi_half  = torch.ones_like(disp_half_px)        # [B,1,H/2,W/2]
 
                 # 오른쪽 half 이미지를 좌로 warp
                 imgR_half_warp_01, valid_half = warp_right_to_left_image(imgR_half_01, disp_half_px)
@@ -858,12 +731,7 @@ def train(args):
                 # Edge-aware smoothness on half res
                 loss_smooth = get_disparity_smooth_loss(disp_half_px, imgL_half_enh_01) * args.w_smooth
 
-
-
-
-                # 최종 loss (기존 + 새 항)
-                # 필요시 다른 항도 활성화 가능
-                # === 1/8: bad 마스크(팽창 없음) ===
+                # === 1/8 seed prior 유틸 ===
                 with torch.no_grad():
                     bad_seed_mask = build_bad_seed_mask_1of8(
                         disp_soft=disp_soft, prob_5d=prob, roi_patch=roi_patch,
@@ -872,15 +740,13 @@ def train(args):
                         use_extremes=True, use_conf=True
                     )
 
-                    # (NEW) 정규화 사각형 범위 마스크 (패치 해상도 기준: roi_patch 크기)
                     seed_rect_mask = make_norm_rect_mask_like(
                         roi_patch, y_min=args.seed_ymin, y_max=args.seed_ymax,
                         x_min=args.seed_xmin, x_max=args.seed_xmax
                     ).bool()
 
-                    # 행 모드 계산용 good 마스크(범위 내에서만 집계)
                     good_mask = (roi_patch > 0) & (~bad_seed_mask)
-                    good_mask = good_mask & seed_rect_mask  # (NEW) 범위 제한
+                    good_mask = good_mask & seed_rect_mask
 
                     D = prob.shape[2] - 1
                     row_mode_idx, row_valid = rowwise_mode_idx_1of8(
@@ -890,26 +756,22 @@ def train(args):
                     seed_idx_map = row_mode_idx.expand(-1, -1, -1, disp_soft.shape[-1])
                     valid_rows   = row_valid.expand_as(bad_seed_mask)
 
-                    # bad 이면서 행 모드 유효 & (NEW) 사각형 범위 내에서만 앵커링
-                    anchor_mask = bad_seed_mask & valid_rows & seed_rect_mask  # (NEW)
+                    anchor_mask = bad_seed_mask & valid_rows & seed_rect_mask
 
-
-                # === 시드 앵커 손실(작게) ===
                 loss_seed = seed_anchor_fn(
                     refined_logits_masked=refined_masked,   # [B,1,D+1,H/8,W/8]
                     seed_idx_map=seed_idx_map,              # [B,1,H/8,W/8]
                     anchor_mask=anchor_mask                 # [B,1,H/8,W/8]
                 ) * args.w_seed
 
-                loss = loss_dir + loss_photo + loss_smooth
-                # if epoch <= 22: 
-                loss += loss_seed
-                
+                loss = loss_dir + loss_photo + loss_smooth + loss_seed
+
+                # === Sky loss (1/2 → 1/8 grid-ALL rule, disp=0 유도) ===
                 loss_sky, aux_sky = sky_loss(
                     refined_logits_masked=aux["refined_masked"],
                     disp_half_px=aux["disp_half_px"],
-                    roi_half=None,          # ★ 기본은 None 권장
-                    roi_patch=None,         # ★ 기본은 None 권장
+                    roi_half=None,          # ROI 사용 안 함
+                    roi_patch=None,         # ROI 사용 안 함
                     names=names,
                     step=(epoch-1)*len(loader)+it
                 )
@@ -919,35 +781,35 @@ def train(args):
             scaler.scale(loss).backward()
             # 안정화
             scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.agg.parameters(), max_norm=5.0)
-            torch.nn.utils.clip_grad_norm_(model.upmask_head.parameters(), max_norm=5.0)
+            if hasattr(model, "agg"):
+                torch.nn.utils.clip_grad_norm_(model.agg.parameters(), max_norm=5.0)
+            if hasattr(model, "upmask_head"):
+                torch.nn.utils.clip_grad_norm_(model.upmask_head.parameters(), max_norm=5.0)
             scaler.step(optim)
             scaler.update()
 
             running += loss.item()
             if it % args.log_every == 0:
-                # 모니터링: 좌/우 soft vs WTA 평균 차이
                 with torch.no_grad():
                     disp_wta = aux["disp_wta"]
                     soft_dx = (roi_patch * (disp_soft - shift_with_mask(disp_soft,0,1)[0]).abs()).sum() / (roi_patch.sum()+1e-6)
                     wta_dx  = (roi_patch * (disp_wta  - shift_with_mask(disp_wta, 0,1)[0]).abs()).sum() / (roi_patch.sum()+1e-6)
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
-                      f"loss={running/args.log_every:.4f} "
+                      f"loss={running/args.log_every:.4f} !!"
                       f"(dir={loss_dir.item():.4f}, hsharp={loss_hsharp.item():.4f}, "
                       f"prob={loss_prob.item():.4f}, ent={loss_ent.item():.4f}, "
                       f"anc={(loss_anchor/max(args.w_anchor,1e-9)).item():.4f}, rep={(loss_reproj/max(args.w_reproj,1e-9)).item():.4f}, "
-                      f"photo={(loss_photo/max(args.w_photo,1e-9)).item():.4f}, smooth={(loss_smooth/max(args.w_smooth,1e-9)).item():.4f}) "
-                      f"seed loss={ (loss_seed/max(args.w_seed,1e-9)).item():.4f}, "
+                      f"photo={(loss_photo/max(args.w_photo,1e-9)).item():.4f}, smooth={(loss_smooth/max(args.w_smooth,1e-9)).item():.4f}, "
+                      f"seed={(loss_seed/max(args.w_seed,1e-9)).item():.4f}, sky={(loss_sky/max(args.w_sky,1e-9)).item():.4f}) "
                       f"| mean|Δx| soft={soft_dx:.3f} wta={wta_dx:.3f}")
                 running = 0.0
 
         if args.save_dir:
             os.makedirs(args.save_dir, exist_ok=True)
-            ckpt_path = os.path.join(args.save_dir, f"stereo_epoch{epoch:03d}.pth")
-            save_checkpoint(ckpt_path, epoch, model, optim, scaler, args)
-            print(f"[Save] {ckpt_path}")
-        
-            
+            if epoch % args.save_every == 0 or epoch == args.epochs:
+                ckpt_path = os.path.join(args.save_dir, f"stereo_epoch{epoch:03d}.pth")
+                save_checkpoint(ckpt_path, epoch, model, optim, scaler, args)
+                print(f"[Save] {ckpt_path}")
 
 
 # ---------------------------
@@ -962,27 +824,23 @@ def parse_args():
     p.add_argument("--right_dir", type=str, required=True)
     p.add_argument("--height", type=int, default=384)
     p.add_argument("--width",  type=int, default=1224)
-    p.add_argument("--mask_dir", type=str, default=None, help="하늘 마스크 폴더(파일명 매칭). 흰색=하늘")
+    # ★ mask_dir 옵션 완전 제거됨
 
     # 모델/학습
     p.add_argument("--max_disp_px", type=int, default=88)
     p.add_argument("--patch_size",  type=int, default=8)
-    p.add_argument("--agg_ch",      type=int, default=32)
+    p.add_argument("--agg_ch",      type=int, default=64)
     p.add_argument("--agg_depth",   type=int, default=3)
-    p.add_argument("--softarg_t",   type=float, default=0.9)  # 초기 탐색↑
-    p.add_argument("--norm",        type=str, default="gn", choices=["bn","gn"], help="3D conv 정규화")
+    p.add_argument("--softarg_t",   type=float, default=0.9)
+    p.add_argument("--norm",        type=str, default="gn", choices=["bn","gn"])
 
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--epochs",     type=int, default=20, help="학습을 마칠 최종 epoch (resume 시 마지막+1 ~ epochs)")
+    p.add_argument("--epochs",     type=int, default=20)
     p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--optim",      type=str, default="adamw", choices=["adamw","adam","sgd"])
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--amp",        action="store_true", help="mixed precision")
-
-    # ROI 축소 옵션
-    p.add_argument("--roi_method", type=str, default="avg", choices=["avg","nearest"])
-    p.add_argument("--roi_thr",    type=float, default=0.5)
 
     # 방향 이웃 제약(soft 기준)
     p.add_argument("--w_dir",        type=float, default=1.0)
@@ -992,8 +850,8 @@ def parse_args():
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
     p.add_argument("--lambda_v",     type=float, default=1.0)
-    p.add_argument("--lambda_h",     type=float, default=1.0)   # 가로는 샤픈 항으로 대체 권장
-    p.add_argument("--huber_delta_h", type=float, default=0.25) # 샤픈 가로 용
+    p.add_argument("--lambda_h",     type=float, default=1.0)
+    p.add_argument("--huber_delta_h", type=float, default=0.25)
 
     # 샤픈 가로 일관성
     p.add_argument("--w_hsharp",   type=float, default=0.0)
@@ -1010,9 +868,9 @@ def parse_args():
     p.add_argument("--anchor_topk",  type=int,   default=2)
     p.add_argument("--w_reproj",     type=float, default=1.0)
 
-    # Photometric / Smoothness 추가
-    p.add_argument("--w_photo",    type=float, default=1.0, help="photometric loss weight")
-    p.add_argument("--w_smooth",   type=float, default=0.01, help="edge-aware smoothness weight")
+    # Photometric / Smoothness
+    p.add_argument("--w_photo",    type=float, default=1.0)
+    p.add_argument("--w_smooth",   type=float, default=0.01)
     p.add_argument("--photo_l1_w",   type=float, default=0.15)
     p.add_argument("--photo_ssim_w", type=float, default=0.85)
 
@@ -1034,31 +892,26 @@ def parse_args():
                    help="체크포인트의 GradScaler 상태를 무시")
 
     # 로깅/저장
-    p.add_argument("--log_every", type=int, default=5)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--save_every", type=int, default=2)
     p.add_argument("--save_dir", type=str, default=f"./log/checkpoints_{current_time}")
-    
     
     # --- 1/8 Seeded Prior (핀 + 고무줄) ---
     p.add_argument("--w_seed", type=float, default=0.0, help="시드 앵커 손실 가중치(작게)")
     p.add_argument("--seed_low_idx_thr",  type=float, default=1.0)
     p.add_argument("--seed_high_idx_thr", type=float, default=1.0)
     p.add_argument("--seed_conf_thr",     type=float, default=0.05)
-    p.add_argument("--seed_road_ymin",    type=float, default=0.8)   # 하단만 적용하고 싶을 때
-    p.add_argument("--seed_bin_w",        type=float, default=1.0)   # 행 모드 bin 폭(패치 인덱스 단위)
-    p.add_argument("--seed_min_count",    type=int,   default=8)     # 행 모드 최소 표본 수
-    p.add_argument("--seed_tau",          type=float, default=0.30)  # 샤프닝 온도(ArgMax 근사)
+    p.add_argument("--seed_road_ymin",    type=float, default=0.8)
+    p.add_argument("--seed_bin_w",        type=float, default=1.0)
+    p.add_argument("--seed_min_count",    type=int,   default=8)
+    p.add_argument("--seed_tau",          type=float, default=0.30)
     p.add_argument("--seed_huber_delta",  type=float, default=0.50)
-    
-        # --- 1/8 Seeded Prior 범위(정규화 좌표) ---
-    p.add_argument("--seed_ymin", type=float, default=0.7,
-                   help="시드 적용 세로 시작(정규화 0~1, 상단=0)")
-    p.add_argument("--seed_ymax", type=float, default=1.0,
-                   help="시드 적용 세로 끝(정규화 0~1, 하단=1)")
-    p.add_argument("--seed_xmin", type=float, default=0.2,
-                   help="시드 적용 가로 시작(정규화 0~1, 좌측=0)")
-    p.add_argument("--seed_xmax", type=float, default=0.8,
-                   help="시드 적용 가로 끝(정규화 0~1, 우측=1)")
+    p.add_argument("--seed_ymin", type=float, default=0.7)
+    p.add_argument("--seed_ymax", type=float, default=1.0)
+    p.add_argument("--seed_xmin", type=float, default=0.2)
+    p.add_argument("--seed_xmax", type=float, default=0.8)
 
+    # Sky loss weight
     p.add_argument("--w_sky", type=float, default=0.0,
                    help="sky weight for SkyZeroLoss")
 
