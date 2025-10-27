@@ -586,7 +586,7 @@ def train(args):
         softarg_t=args.softarg_t,
         norm=args.norm,
         sim_fusion_mode="late_weighted",  # ★ semantic 보존
-        dino_weight=0.8,
+        dino_weight=0.9,
         fuse_feat_mode=None,
         cnn_center=True,
         spx_source="dino"
@@ -859,7 +859,7 @@ def parse_args():
     p.add_argument("--amp",        action="store_true", help="mixed precision")
 
     # 방향 이웃 제약(soft 기준)
-    p.add_argument("--w_dir",        type=float, default=0.1)
+    p.add_argument("--w_dir",        type=float, default=1.0)
     p.add_argument("--sim_thr",      type=float, default=0.8)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)

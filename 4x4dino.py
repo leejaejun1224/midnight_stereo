@@ -344,10 +344,10 @@ def parse_args():
     p.add_argument('--output_dir', default='./output_clickviz')
     p.add_argument("--alpha", type=float, default=0.5)
     # ---- Key options to keep semantics ----
-    p.add_argument("--sim_mode", type=str, default="late_weighted",
+    p.add_argument("--sim_mode", type=str, default="late_and",
                    choices=["dino_only","late_weighted","late_and","fused_concat","fused_sum"],
                    help="Where to compute cosine similarity. Prefer late_* to preserve semantics.")
-    p.add_argument("--dino_weight", type=float, default=0.85,
+    p.add_argument("--dino_weight", type=float, default=0.65,
                    help="Weight for DINO similarity in late fusion (0~1). Higher => more semantic.")
     p.add_argument("--cnn_center", action="store_true", default=True,
                    help="Spatially center & whiten CNN features to remove global color/intensity bias.")
