@@ -564,7 +564,7 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     ck_args = ckpt.get("args", {})
-    max_disp_px = ck_args.get("max_disp_px", 40)
+    max_disp_px = ck_args.get("max_disp_px", 88)
     patch_size  = ck_args.get("patch_size", args.patch_size)
     agg_ch      = ck_args.get("agg_ch", 32)
     agg_depth   = ck_args.get("agg_depth", 3)
