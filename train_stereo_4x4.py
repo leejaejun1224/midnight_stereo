@@ -585,12 +585,20 @@ def train(args):
         agg_depth=args.agg_depth,
         softarg_t=args.softarg_t,
         norm=args.norm,
-        sim_fusion_mode="late_weighted",  # ★ semantic 보존
-        dino_weight=0.9,
+
+        # === 여기만 바꾸면 새 cost-volume 입력 사용 ===
+        sim_fusion_mode="learned_fused",   # ★ 새 모드
+        dino_weight=0.65,
         fuse_feat_mode=None,
+        sum_alpha = 0.5,
         cnn_center=True,
-        spx_source="dino"
-    ).to(device)
+        spx_source="dino",
+        # 1×1 conv/MLP 옵션
+        cv_fuse_out_ch=768,
+        cv_fuse_arch="conv1x1",            # 또는 "mlp"
+
+        # 나머지 기존 설정
+        ).to(device)
 
     # 손실 모듈들
     dir_loss_fn = DirectionalRelScaleDispLoss(
@@ -704,7 +712,7 @@ def train(args):
                 loss_smooth = get_disparity_smooth_loss(disp_full_px, imgL_enh_01) * args.w_smooth
 
                 # 1/4 손실들
-                loss_dir    = dir_loss_fn(disp_soft, FL_dino, roi_patch) * args.w_dir
+                loss_dir    = dir_loss_fn(disp_soft, aux["feat_dir_L"], roi_patch) * args.w_dir
                 loss_hsharp = hsharp_fn(refined_masked, FL_dino, roi_patch) * args.w_hsharp
                 loss_prob   = prob_cons_fn(prob, FL_dino, roi_patch) * args.w_probcons
                 loss_ent    = entropy_fn(prob, FL_dino, roi_patch) * args.w_entropy
@@ -860,7 +868,7 @@ def parse_args():
 
     # 방향 이웃 제약(soft 기준)
     p.add_argument("--w_dir",        type=float, default=1.0)
-    p.add_argument("--sim_thr",      type=float, default=0.8)
+    p.add_argument("--sim_thr",      type=float, default=0.75)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)
     p.add_argument("--use_dynamic_thr", action="store_true")

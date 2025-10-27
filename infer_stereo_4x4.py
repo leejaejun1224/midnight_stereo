@@ -578,9 +578,31 @@ def main():
     assert_multiple(args.height, patch_size, "height")
     assert_multiple(args.width,  patch_size, "width")
 
-    model = StereoModel(max_disp_px=max_disp_px, patch_size=patch_size,
-                        agg_base_ch=agg_ch, agg_depth=agg_depth,
-                        softarg_t=softarg_t, norm=norm).to(device)
+    # model = StereoModel(max_disp_px=max_disp_px, patch_size=patch_size,
+    #                     agg_base_ch=agg_ch, agg_depth=agg_depth,
+    #                     softarg_t=softarg_t, norm=norm).to(device)
+    
+    model = StereoModel(
+        max_disp_px=max_disp_px,
+        patch_size=patch_size,
+        agg_base_ch=agg_ch,
+        agg_depth=agg_depth,
+        softarg_t=softarg_t,
+        norm=norm,
+
+        # === 여기만 바꾸면 새 cost-volume 입력 사용 ===
+        sim_fusion_mode="learned_fused",   # ★ 새 모드
+        dino_weight=0.65,
+        fuse_feat_mode=None,
+        sum_alpha = 0.5,
+        cnn_center=True,
+        spx_source="dino",
+        # 1×1 conv/MLP 옵션
+        cv_fuse_out_ch=768,
+        cv_fuse_arch="conv1x1",            # 또는 "mlp"
+
+        # 나머지 기존 설정
+        ).to(device)
     # DPT 대안 사용 시: 주석 해제
     # model = DPTStereoTrainCompat(max_disp_px=max_disp_px, patch_size=patch_size,
     #                              feat_dim=256, readout='project', embed_dim=768, temperature=0.7).to(device)

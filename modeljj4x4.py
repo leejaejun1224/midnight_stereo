@@ -168,7 +168,7 @@ class FusedQuarterFeatures(nn.Module):
 
         # DINO 1/8 → 1/4
         Fd8 = _dino_tokens_to_grid(self.dino, x_dino, self.patch)      # [B,Cd,H/8,W/8]
-        Fd4 = F.interpolate(Fd8, scale_factor=2, mode='nearest')       # [B,Cd,H/4,W/4]
+        Fd4 = F.interpolate(Fd8, scale_factor=2, mode='bilinear', align_corners=True)       # [B,Cd,H/4,W/4]
         Fd4 = F.normalize(Fd4, dim=1, eps=1e-6)
 
         # CNN 1/4
@@ -353,6 +353,13 @@ class SPX4xHead(nn.Module):
 # ---------------------------
 # Stereo Model (1/4 cost + direct 4× upsample to full)
 # ---------------------------
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ... (위쪽 유틸/블록/함수들은 기존 그대로) ...
+
 
 class StereoModel(nn.Module):
     def __init__(self,
@@ -362,17 +369,20 @@ class StereoModel(nn.Module):
                  agg_depth: int = 3,
                  softarg_t: float = 0.9,
                  norm: str = 'gn',
-                 # --- 특징/유사도 결합 옵션 ---
-                 sim_fusion_mode: str = "late_weighted",   # 'dino_only' | 'late_weighted' | 'concat' | 'sum'
-                 dino_weight: float = 0.90,                # late_weighted일 때 DINO 가중치(0~1)
-                 fuse_feat_mode: str = None,               # concat | sum (특징 레벨 결합 필요시)
-                 sum_alpha: float = 0.5,                   # fuse_feat_mode='sum' 가중치
-                 cnn_center: bool = True,                  # CNN 공간 중심화/화이트닝
-                 spx_source: str = "dino"                  # 업샘플 가중치 예측에 사용할 특징: 'dino' | 'fused' | 'cnn'
+                 # --- 기존 옵션 ---
+                 sim_fusion_mode: str = "late_weighted",    # 'late_weighted' | 'dino_only' | 'concat' | 'sum' | 'learned_fused'
+                 dino_weight: float = 0.90,                 # late_weighted 가중치
+                 fuse_feat_mode: str = None,                # FusedQuarterFeatures 내부용 (그대로)
+                 sum_alpha: float = 0.5,
+                 cnn_center: bool = True,
+                 spx_source: str = "dino",
+                 # --- [NEW] cost volume용 학습 결합기 설정 ---
+                 cv_fuse_out_ch: int = 96,                  # learned_fused 출력 채널 수
+                 cv_fuse_arch: str = "conv1x1"              # "conv1x1" | "mlp"
                  ):
         super().__init__()
         self.patch = patch_size
-        self.grid_stride = self.patch // 2  # 1/4 격자 스텝(px) = 4
+        self.grid_stride = self.patch // 2  # 1/4 그리드 스텝(px) = 4
         if self.patch % 2 != 0:
             raise ValueError(f"patch_size={self.patch} 는 짝수여야 합니다. (1/4 그리드 스텝용)")
         assert_multiple(max_disp_px, self.grid_stride, "max_disp_px")
@@ -397,17 +407,42 @@ class StereoModel(nn.Module):
         self.post = SoftAndArgMax(D=self.D, temperature=softarg_t)
 
         # 3) stem 피처 (full-res, quarter-res)
-        self.stem_1 = nn.Sequential(                 # full-res skip
+        self.stem_1 = nn.Sequential(
             ConvBNReLU(3, 32, k=3, s=1, p=1),
             ConvBNReLU(32, 32, k=3, s=1, p=1),
         )
-        self.stem_4 = nn.Sequential(                 # H → H/4 (stride2×2)
+        self.stem_4 = nn.Sequential(
             ConvBNReLU(3, 32, k=3, s=2, p=1),        # H → H/2
             ConvBNReLU(32, 48, k=3, s=2, p=1),       # H/2 → H/4
             ConvBNReLU(48, 48, k=3, s=1, p=1),
         )
 
-        # spx 입력 채널 계산
+        # --- [NEW] cost volume용 학습 결합기 (concat → 1×1 conv or 1×1 MLP) ---
+        self.cv_fuse = None
+        self.cv_out_norm = False
+        sum_ch = self.feat_net.channels("dino") + self.feat_net.channels("cnn")
+        self.cv_fuse_out_ch = int(cv_fuse_out_ch)
+        self.cv_fuse_arch = str(cv_fuse_arch).lower()
+
+        if self.sim_fusion_mode in ("learned_fused",):  # 새 모드에서만 사용
+            if self.cv_fuse_arch == "mlp":
+                mid_ch = max(self.cv_fuse_out_ch, sum_ch // 2)
+                self.cv_fuse = nn.Sequential(
+                    nn.Conv2d(sum_ch, mid_ch, kernel_size=1, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(mid_ch, self.cv_fuse_out_ch, kernel_size=1, bias=False),
+                    nn.GroupNorm(num_groups=8, num_channels=self.cv_fuse_out_ch),
+                    nn.ReLU(inplace=True)
+                )
+            else:  # "conv1x1"
+                self.cv_fuse = nn.Sequential(
+                    nn.Conv2d(sum_ch, self.cv_fuse_out_ch, kernel_size=1, bias=False),
+                    nn.GroupNorm(num_groups=8, num_channels=self.cv_fuse_out_ch),
+                    nn.ReLU(inplace=True)
+                )
+            self.cv_out_norm = True  # dot corr 전에 L2 정규화
+
+        # spx 입력 채널 계산 (그대로)
         if self.spx_source == "dino":
             feat_ch_spx = self.feat_net.channels("dino")
         elif self.spx_source == "cnn":
@@ -417,46 +452,72 @@ class StereoModel(nn.Module):
         else:
             raise ValueError("spx_source must be 'dino'|'cnn'|'fused'")
 
-        # H/4에서 특징(spx_source)과 stem_4을 결합해 spx 분기 입력 생성 → full up-weights 예측
-        self.spx_4 = nn.Sequential(
-            ConvBNReLU(feat_ch_spx + 48, 64, k=3, s=1, p=1)   # [B,64,H/4,W/4]
-        )
-        self.spx_full = SPX4xHead(in_ch=64, skip_ch=32, mid_ch=64)     # up-weights at full-res
+        self.spx_4 = nn.Sequential(ConvBNReLU(feat_ch_spx + 48, 64, k=3, s=1, p=1))
+        self.spx_full = SPX4xHead(in_ch=64, skip_ch=32, mid_ch=64)
 
     @torch.no_grad()
     def extract_feats(self, left: torch.Tensor, right: torch.Tensor):
-        """
-        return dicts: {'dino': [B,Cd,H/4,W/4], 'cnn': [B,24,H/4,W/4], 'fused': [B,Cf,H/4,W/4] or None}
-        """
         FL = self.feat_net(left)
         FR = self.feat_net(right)
         return FL, FR
 
+    def _build_dir_feat(self, FL_dict, FR_dict):
+        """
+        [NEW] directional loss 용 feature 생성
+        정의: f_dir = [ sqrt(a)*u  ||  sqrt(1-a)*w ],  (u,w는 채널 L2 정규화 완료)
+        내적이 a*cos_dino + (1-a)*cos_cnn 와 정확히 일치.
+        """
+        a = float(self.dino_weight)
+        sa = math.sqrt(max(a, 0.0))
+        sb = math.sqrt(max(1.0 - a, 0.0))
+
+        uL, uR = FL_dict["dino"], FR_dict["dino"]   # [B,Cd,H/4,W/4], L2 normalized
+        wL, wR = FL_dict["cnn"],  FR_dict["cnn"]    # [B,24,H/4,W/4],  L2 normalized
+
+        fdirL = torch.cat([uL * sa, wL * sb], dim=1)
+        fdirR = torch.cat([uR * sa, wR * sb], dim=1)
+        # 이론상 이미 ‖fdir‖=1 이지만, 수치 안정 위해 얕게 normalize
+        fdirL = F.normalize(fdirL, dim=1, eps=1e-6)
+        fdirR = F.normalize(fdirR, dim=1, eps=1e-6)
+        return fdirL, fdirR
+
+    def _build_cost_volume_inputs(self, FL_dict, FR_dict):
+        """
+        [NEW] cost volume 입력 feature 쌍 생성
+        - learned_fused: concat(DINO,CNN) → 1×1 conv/MLP → L2 norm
+        - 그 외 모드는 기존 로직(아래 forward에서 처리)
+        """
+        assert self.cv_fuse is not None, "learned_fused 모드에서만 호출됩니다."
+        FdL, FdR = FL_dict["dino"], FR_dict["dino"]
+        FcL, FcR = FL_dict["cnn"],  FR_dict["cnn"]
+
+        inL = torch.cat([FdL, FcL], dim=1)
+        inR = torch.cat([FdR, FcR], dim=1)
+        outL = self.cv_fuse(inL)
+        outR = self.cv_fuse(inR)
+        if self.cv_out_norm:
+            outL = F.normalize(outL, dim=1, eps=1e-6)
+            outR = F.normalize(outR, dim=1, eps=1e-6)
+        return outL, outR
+
     def forward(self, left: torch.Tensor, right: torch.Tensor):
-        """
-        Returns:
-          prob:         [B,1,D+1,H/4,W/4]
-          disp_soft:    [B,1,H/4,W/4]        (단위: 1/4 격자 스텝)
-          aux: dict(
-             features / volumes / masks / disp_wta,
-             disp_full:      [B,1,H,W]      (단위: 1/4 격자 스텝)
-             disp_full_px:   [B,1,H,W]      (픽셀; photometric/edge-aware용)
-             up_w_full:      [B,9,H,W]      (context upsample 가중치)
-          )
-        """
         B, _, H, W = left.shape
-        # 안전: 입력 해상도는 patch의 배수여야 함 (DINO 경로 제약)
         assert_multiple(H, self.patch, "height")
         assert_multiple(W, self.patch, "width")
 
-        # 1) features (1/4 해상도 dict)
+        # ---- 1) 특징 (1/4) ----
         FL_dict, FR_dict = self.extract_feats(left, right)
 
-        # 2) cost volume (선택적 결합 방식)
+        # ---- [NEW] directional loss용 feature (가중합 cos-sim 재현) ----
+        feat_dir_L, feat_dir_R = self._build_dir_feat(FL_dict, FR_dict)
+
+        # ---- 2) cost volume (모드별) ----
         mode = self.sim_fusion_mode
+
         if mode == "dino_only":
             FL, FR = FL_dict["dino"], FR_dict["dino"]
             vol, mask = build_corr_volume_with_mask(FL, FR, self.D)
+
         elif mode == "late_weighted":
             FLd, FRd = FL_dict["dino"], FR_dict["dino"]
             FLc, FRc = FL_dict["cnn"],  FR_dict["cnn"]
@@ -464,29 +525,33 @@ class StereoModel(nn.Module):
             vol_c, mask_c = build_corr_volume_with_mask(FLc, FRc, self.D)
             a = self.dino_weight
             vol  = a * vol_d + (1.0 - a) * vol_c
-            mask = (mask_d * mask_c)  # 동일 마스크이므로 곱
-        elif mode == "concat":
+            mask = (mask_d * mask_c)  # 동일 마스크
+
+        elif mode in ("concat", "sum"):
+            # 기존 FusedQuarterFeatures 경로 그대로 사용
             FfL, FfR = FL_dict["fused"], FR_dict["fused"]
-            assert FfL is not None, "fuse_feat_mode='concat' 필요"
+            assert FfL is not None, "fuse_feat_mode가 필요합니다."
             vol, mask = build_corr_volume_with_mask(FfL, FfR, self.D)
-        elif mode == "sum":
-            FfL, FfR = FL_dict["fused"], FR_dict["fused"]
-            assert FfL is not None, "fuse_feat_mode='sum' 필요"
-            vol, mask = build_corr_volume_with_mask(FfL, FfR, self.D)
+
+        elif mode == "learned_fused":
+            # [NEW] concat → 1×1 conv(or 1×1 MLP) → L2 norm → cost volume
+            FL_fused, FR_fused = self._build_cost_volume_inputs(FL_dict, FR_dict)
+            vol, mask = build_corr_volume_with_mask(FL_fused, FR_fused, self.D)
+
         else:
-            raise ValueError("sim_fusion_mode must be 'dino_only'|'late_weighted'|'concat'|'sum'")
+            raise ValueError("sim_fusion_mode must be 'dino_only'|'late_weighted'|'concat'|'sum'|'learned_fused'")
 
         vol_in = vol * mask
 
-        # 3) 3D aggregation @ 1/4
-        refined = self.agg(vol_in)                        # [B,1,D+1,H/4,W/4]
+        # ---- 3) 3D aggregation @ 1/4 ----
+        refined = self.agg(vol_in)
         refined_masked = refined + (1.0 - mask) * (-1e4)
 
-        # 4) soft-arg + WTA
-        prob, disp_soft, disp_wta = self.post(refined_masked)     # disp_soft: [B,1,H/4,W/4]
+        # ---- 4) soft-arg + WTA ----
+        prob, disp_soft, disp_wta = self.post(refined_masked)
         raw_for_anchor = (vol + (1.0 - mask) * (-1e4)).detach()
 
-        # 5) full-res up-weights 예측 (1/4 입력 → 1 업샘플 가중치)
+        # ---- 5) full-res up-weights 예측 ----
         stem1 = self.stem_1(left)          # [B,32,H,W]
         stem4 = self.stem_4(left)          # [B,48,H/4,W/4]
 
@@ -499,13 +564,13 @@ class StereoModel(nn.Module):
             if spx_feat_L is None:
                 raise ValueError("spx_source='fused'지만 fused features가 없음 (fuse_feat_mode 설정 확인)")
 
-        spx4_in = torch.cat([spx_feat_L, stem4], dim=1)  # [B, Cspx+48, H/4, W/4]
+        spx4_in = torch.cat([spx_feat_L, stem4], dim=1)
         xspx4   = self.spx_4(spx4_in)                    # [B,64,H/4,W/4]
         up_w_full = self.spx_full(xspx4, stem1)          # [B,9,H,W]
 
-        # 6) ACVNet-style context_upsample: 1/4 → 1 (×4, 한 번)
-        disp_full = context_upsample_scaled(disp_soft, up_w_full, scale=4).unsqueeze(1)  # [B,1,H,W]
-        disp_full_px = disp_full * float(self.grid_stride)  # 1 스텝 = 4 px
+        # ---- 6) ACVNet-style context_upsample ----
+        disp_full = context_upsample_scaled(disp_soft, up_w_full, scale=4).unsqueeze(1)
+        disp_full_px = disp_full * float(self.grid_stride)
 
         return prob, disp_soft, {
             "FL": FL_dict, "FR": FR_dict,
@@ -517,4 +582,9 @@ class StereoModel(nn.Module):
             "disp_full": disp_full,
             "disp_full_px": disp_full_px,
             "up_w_full": up_w_full,
+            # [NEW] directional loss용 feature (좌/우 둘 다 제공; 보통 좌만 사용)
+            "feat_dir_L": feat_dir_L,
+            "feat_dir_R": feat_dir_R,
+            # [NEW] learned_fused 모드 사용 시 디버깅용
+            "cv_mode": mode,
         }
