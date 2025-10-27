@@ -894,7 +894,7 @@ def parse_args():
 
     # Photometric / Smoothness
     p.add_argument("--w_photo",    type=float, default=1.0)
-    p.add_argument("--w_smooth",   type=float, default=0.1)
+    p.add_argument("--w_smooth",   type=float, default=0.01)
     p.add_argument("--photo_l1_w",   type=float, default=0.15)
     p.add_argument("--photo_ssim_w", type=float, default=0.85)
 
