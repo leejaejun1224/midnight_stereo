@@ -35,7 +35,7 @@ from losses import (
     NeighborProbConsistencyLoss, EntropySharpnessLoss, FeatureReprojLoss,
     SeedAnchorHuberLoss, SkyGridZeroLoss
 )
-
+from calib.calib import *
 
 # ---------------------------
 # 유틸
@@ -541,12 +541,11 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
     start_epoch = last_epoch + 1
     print(f"[Resume] 마지막 epoch={last_epoch} → 재시작 epoch={start_epoch}")
     return start_epoch
-
 def train(args):
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- NEW: metrics import (함수 내부 임포트로 외부 변경 최소화) ---
+    # --- NEW: realtime metrics on/off & import ---
     enable_realtime = bool(
         getattr(args, "realtime_test", False) and
         (getattr(args, "gt_disp_dir", None) or getattr(args, "gt_depth_dir", None))
@@ -554,8 +553,26 @@ def train(args):
     if enable_realtime:
         eval_cfg = MS2EvalConfig()
 
-    # ---------------------------------------------------------------
 
+    # 인자에 값이 없으면 자동으로 채운다.
+    
+    fx_auto, bl_auto, src = resolve_fx_baseline(
+        left_dir=args.left_dir,
+        focal_px=getattr(args, "focal_px", 0.0),
+        baseline_m=getattr(args, "baseline_m", 0.0),
+        calib_npy=getattr(args, "calib_npy", None),
+        K_left_npy=getattr(args, "K_left_npy", None),
+        T_lr_npy=getattr(args, "T_lr_npy", None),
+        modality="rgb"
+    )
+    if fx_auto is not None and getattr(args, "focal_px", 0.0) <= 0:
+        args.focal_px = fx_auto
+    if bl_auto is not None and getattr(args, "baseline_m", 0.0) <= 0:
+        args.baseline_m = bl_auto
+    if enable_realtime:
+        print(f"[Calib] fx(px)={getattr(args,'focal_px',0.0):.3f}  baseline(m)={getattr(args,'baseline_m',0.0):.4f}  (src: {src})")
+
+    # -------------------- 기존 파트 --------------------
     dataset = StereoFolderDataset(args.left_dir, args.right_dir,
                                   height=args.height, width=args.width)
     loader = DataLoader(dataset, batch_size=args.batch_size,
@@ -569,7 +586,7 @@ def train(args):
         softarg_t=args.softarg_t,
         norm=args.norm,
         sim_fusion_mode="late_weighted",  # ★ semantic 보존
-        dino_weight=0.8,
+        dino_weight=0.9,
         fuse_feat_mode=None,
         cnn_center=True,
         spx_source="dino"
@@ -599,16 +616,14 @@ def train(args):
         conf_alpha=1.0, sim_thr=args.sim_thr, sim_gamma=args.sim_gamma,
         sample_k=args.sim_sample_k, use_dynamic_thr=True, dynamic_q=args.dynamic_q).to(device)
 
-    # anchor_loss_fn = CorrAnchorLoss(tau=args.anchor_tau, margin=args.anchor_margin,
-    #                                 topk=args.anchor_topk, use_huber=True).to(device)
     reproj_loss_fn = FeatureReprojLoss().to(device)
     
     seed_anchor_fn = SeedAnchorHuberLoss(
         tau=args.seed_tau, huber_delta=args.seed_huber_delta
     ).to(device)
 
-    # --- FIX: PhotometricLoss 생성자 인자 수정 ---
-    photo_crit = PhotometricLoss(w_l1=args.photo_l1_w, w_ssim=args.photo_ssim_w).to(device)
+    # PhotometricLoss 생성자 인자 수정됨
+    photo_crit = PhotometricLoss(w_l1 = args.photo_l1_w, w_ssim = args.photo_ssim_w).to(device)
 
     sky_loss = SkyGridZeroLoss(
         max_disp_px=args.max_disp_px,
@@ -693,7 +708,6 @@ def train(args):
                 loss_hsharp = hsharp_fn(refined_masked, FL_dino, roi_patch) * args.w_hsharp
                 loss_prob   = prob_cons_fn(prob, FL_dino, roi_patch) * args.w_probcons
                 loss_ent    = entropy_fn(prob, FL_dino, roi_patch) * args.w_entropy
-                # loss_anchor = anchor_loss_fn(raw_vol, disp_soft, mask=mask_d, roi=roi_patch) * args.w_anchor
                 loss_reproj = reproj_loss_fn(FL_dino, FR_dino, disp_soft, roi=roi_patch) * args.w_reproj
 
                 # ★ Sky loss: refined_logits 1/4 → 1/8로, disp_full_px → half로 스케일 일치
@@ -744,7 +758,6 @@ def train(args):
                     # --- NEW: Realtime MS2 metrics (현재 배치) ---
                     extra_eval = ""
                     if enable_realtime:
-                        # GT 로드 (좌영상과 동일 파일명 가정)
                         H, W = imgL.shape[-2], imgL.shape[-1]
                         gt = load_ms2_gt_batch(
                             names=names,
@@ -753,32 +766,17 @@ def train(args):
                             gt_disp_dir=getattr(args, "gt_disp_dir", None),
                             gt_depth_dir=getattr(args, "gt_depth_dir", None),
                             gt_disp_scale=getattr(args, "gt_disp_scale", 1.0),
-                            gt_depth_scale=getattr(args, "gt_depth_scale", 1.0),
+                            gt_depth_scale=getattr(args, "gt_depth_scale", 256.0),  # RGB depth PNG 기본 256 스케일 가정
                         )
 
                         disp_msg, depth_msg, depth_w_msg = "", "", ""
 
-                        # Disparity metrics: EPE, D1-all, >kpx
-                        if gt["gt_disp"] is not None:
-                            disp_metrics = compute_ms2_disparity_metrics(
-                                pred_disp=aux["disp_full_px"],  # [B,1,H,W]
-                                gt_disp=gt["gt_disp"],
-                                valid=gt["valid"],
-                                cfg=eval_cfg
-                            )
-                            disp_msg = fmt_disp_metrics(disp_metrics)
-
-                        # Depth metrics (옵션): focal/baseline 있어야 pred depth 계산 가능
+                        # (1) Depth 지표 (fx/baseline 필요)
                         has_fb = (getattr(args, "focal_px", 0.0) > 0.0) and (getattr(args, "baseline_m", 0.0) > 0.0)
-                        can_depth = bool(has_fb and (gt["gt_depth"] is not None or gt["gt_disp"] is not None))
-                        if can_depth:
-                            if gt["gt_depth"] is None:
-                                gt_depth = disparity_to_depth(gt["gt_disp"], args.focal_px, args.baseline_m)
-                            else:
-                                gt_depth = gt["gt_depth"]
 
+                        if gt["gt_depth"] is not None and has_fb:
                             pred_depth = disparity_to_depth(aux["disp_full_px"], args.focal_px, args.baseline_m)
-
+                            gt_depth   = gt["gt_depth"]
                             depth_metrics = compute_depth_metrics(pred_depth, gt_depth, gt["valid"], cfg=eval_cfg)
                             depth_w_metrics = compute_bin_weighted_depth_metrics(
                                 pred_depth, gt_depth, gt["valid"],
@@ -788,6 +786,20 @@ def train(args):
                             )
                             depth_msg   = fmt_depth_metrics(depth_metrics)
                             depth_w_msg = fmt_weighted_depth_metrics(depth_w_metrics)
+
+                        # (2) Disparity 지표
+                        gt_disp_for_metrics = gt["gt_disp"]
+                        # GT disp 없고, GT depth + fb 있으면 depth->disp 변환해서 EPE/D1 계산
+                        if gt_disp_for_metrics is None and gt["gt_depth"] is not None and has_fb:
+                            gt_disp_for_metrics = (args.focal_px * args.baseline_m) / gt["gt_depth"].clamp_min(1e-6)
+                        if gt_disp_for_metrics is not None:
+                            disp_metrics = compute_ms2_disparity_metrics(
+                                pred_disp=aux["disp_full_px"],
+                                gt_disp=gt_disp_for_metrics,
+                                valid=gt["valid"],
+                                cfg=eval_cfg
+                            )
+                            disp_msg = fmt_disp_metrics(disp_metrics)
 
                         parts = []
                         if disp_msg:    parts.append("[Disp] "    + disp_msg)
@@ -803,7 +815,7 @@ def train(args):
                       f"prob={loss_prob.item():.4f}, ent={loss_ent.item():.4f}, "
                       f"rep={(loss_reproj/max(args.w_reproj,1e-9)).item():.4f}, "
                       f"photo={(loss_photo/max(args.w_photo,1e-9)).item():.4f}, smooth={(loss_smooth/max(args.w_smooth,1e-9)).item():.4f}, "
-                      f"sky={(loss_sky/max(args.w_sky,1e-9)).item():.4f}) "
+                    #   f"sky={(loss_sky/max(args.w_sky,1e-9)).item():.4f}) "
                       f"| mean|Δx| soft={soft_dx:.3f} wta={wta_dx:.3f}"
                       f"{extra_eval}"
                 )
@@ -815,6 +827,7 @@ def train(args):
                 ckpt_path = os.path.join(args.save_dir, f"stereo_epoch{epoch:03d}.pth")
                 save_checkpoint(ckpt_path, epoch, model, optim, scaler, args)
                 print(f"[Save] {ckpt_path}")
+
 
 # ---------------------------
 # 메인
@@ -914,25 +927,22 @@ def parse_args():
     p.add_argument("--w_sky", type=float, default=0.0)
 
 
-    # --- NEW: Realtime eval ---
-    p.add_argument("--realtime_test", action="store_true",
-                   help="배치별 예측에 대해 MS2 논문 지표를 즉시 계산/출력")
-    p.add_argument("--gt_disp_dir", type=str, default=None,
-                   help="GT disparity 디렉토리(좌영상 파일명과 동일명)")
-    p.add_argument("--gt_depth_dir", type=str, default=None,
-                   help="GT depth 디렉토리(선택, meters)")
-    p.add_argument("--gt_disp_scale", type=float, default=1.0,
-                   help="GT disparity 스케일 나눗값 (예: 256)")
-    p.add_argument("--gt_depth_scale", type=float, default=1.0,
-                   help="GT depth 스케일 나눗값")
-    p.add_argument("--focal_px", type=float, default=0.0,
-                   help="(선택) 깊이-시차 변환용 초점거리(px)")
-    p.add_argument("--baseline_m", type=float, default=0.0,
-                   help="(선택) 깊이-시차 변환용 베이스라인(m)")
-    p.add_argument("--eval_num_bins", type=int, default=5,
-                   help="가중(depth-bin) metrics bin 수 (DTD'24)")
-    p.add_argument("--eval_max_depth_m", type=float, default=50.0,
-                   help="가중(depth-bin) metrics 깊이 상한")
+    # Realtime eval
+    p.add_argument("--realtime_test", action="store_true")
+    p.add_argument("--gt_disp_dir", type=str, default=None)
+    p.add_argument("--gt_depth_dir", type=str, default=None)
+    p.add_argument("--gt_disp_scale", type=float, default=1.0)
+    p.add_argument("--gt_depth_scale", type=float, default=256.0)  # RGB depth PNG 기본 256 가정
+    p.add_argument("--eval_num_bins", type=int, default=5)
+    p.add_argument("--eval_max_depth_m", type=float, default=50.0)
+
+    # Calib auto-load
+    p.add_argument("--calib_npy", type=str, default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/calib.npy")
+    p.add_argument("--K_left_npy", type=str, default="/home/jaejun/dataset/MS2/intrinsic_left.npy")
+    p.add_argument("--T_lr_npy", type=str, default=None, help="4x4 extrinsic .npy (left->right)")
+    p.add_argument("--focal_px", type=float, default=764.5138549804688)
+    p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
+
 
 
 
