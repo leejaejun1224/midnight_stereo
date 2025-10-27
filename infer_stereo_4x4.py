@@ -417,7 +417,6 @@ def _resize_np(nn: np.ndarray, size_hw: tuple, mode: str = "nearest") -> np.ndar
     else:
         resample = Image.NEAREST if mode == "nearest" else Image.BILINEAR
         return np.array(Image.fromarray(nn).resize((Wt, Ht), resample=resample))
-
 @torch.no_grad()
 def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px):
     imgL = load_image(left_path, args.height, args.width).to(device)
@@ -438,7 +437,6 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
 
     # --- 중간 해상도 지도 처리 ---
     # 모델이 'half' 레벨 px 지도를 제공하면 사용 (이 값은 해당 해상도 'px 단위'라고 가정)
-    disp_px_half = None
     if "disp_half_px" in aux:
         disp_half_px_halfunit = aux["disp_half_px"][0, 0].cpu().numpy().astype(np.float32)  # (H_mid, W_mid)
         H_mid, W_mid = disp_half_px_halfunit.shape
@@ -452,12 +450,15 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
         warnings.warn("[INFO] aux['disp_half_px'] 없음 → 저해상도 full‑px 지도를 H/2로 업샘플해 대체합니다.")
 
     # --- 최종: 항상 원본 크기(HxW) full‑px 지도로 출력 ---
-    base = disp_px_half if args.pred_scale == "half" else disp_px_lo
-    base_h = disp_px_half.shape[0] if args.pred_scale == "half" else disp_px_lo.shape[0]
-    base_w = disp_px_half.shape[1] if args.pred_scale == "half" else disp_px_lo.shape[1]
-
-    interp_mode = "linear" if args.upsample_mode == "linear" else "nearest"
-    disp_px_full = _resize_np(base, (args.height, args.width), mode=interp_mode).astype(np.float32)
+    # ✅ 핵심: 모델이 full-res 픽셀 단위 결과를 주면 그것을 '그대로' 사용
+    if "disp_full_px" in aux:
+        disp_px_full = aux["disp_full_px"][0, 0].detach().float().cpu().numpy().astype(np.float32)
+        interp_mode = "direct(aux)"
+    else:
+        # 구버전 호환: 기존 로직(half 또는 lo 기준 업샘플)
+        base = disp_px_half if args.pred_scale == "half" else disp_px_lo
+        interp_mode = "linear" if args.upsample_mode == "linear" else "nearest"
+        disp_px_full = _resize_np(base, (args.height, args.width), mode=interp_mode).astype(np.float32)
 
     # ---- ROI 보정 및 bad mask 생성 (항상 full 해상도에 적용) ----
     badmask_full = None
@@ -488,18 +489,20 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
           f"interp={interp_mode}")
 
     return {
-        # 저장/후처리용
+        # 저장/후처리용(원본 코드 형식을 유지)
         "disp_patch": disp_lo_grid,            # (H/cv_down, W/cv_down), 단위=grid step
         "disp_px_lo": disp_px_lo,              # (H/cv_down, W/cv_down), 단위=full‑px
         "disp_px_half": disp_px_half,          # (H/2, W/2), 단위=full‑px
-        "disp_px_full": disp_px_full,          # (H, W),   단위=full‑px  ← 최종
+        "disp_px_full": disp_px_full,          # (H, W),   단위=full‑px  ← ★ 여기만 aux['disp_full_px'] 우선
         "badmask_full": badmask_full,
         "max_disp_px": max_disp_px,
-        "patch_size": patch_size,              # 백본 요구사항용(1/8 ViT 등)
-        "cv_down": cv_down,                    # 동적으로 추정한 격자 비율(4 또는 8 등)
+        "patch_size": patch_size,
+        "cv_down": cv_down,
     }
 
+
 def main():
+    max_disp = 64  # 기본값, 체크포인트에서 덮어씀
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=str, required=True)
     ap.add_argument("--left_dir", type=str, required=True, help="좌 이미지 파일 또는 디렉터리")
@@ -526,7 +529,7 @@ def main():
 
     # colorbar options
     ap.add_argument("--color_min", type=float, default=0.0)
-    ap.add_argument("--color_max", type=float, default=40.0)
+    ap.add_argument("--color_max", type=float, default=max_disp)
     ap.add_argument("--colorbar_width", type=int, default=24)
     ap.add_argument("--colorbar_pad", type=int, default=8)
     ap.add_argument("--colorbar_label_width", type=int, default=48)
@@ -564,7 +567,7 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     ck_args = ckpt.get("args", {})
-    max_disp_px = ck_args.get("max_disp_px", 88)
+    max_disp_px = ck_args.get("max_disp_px", max_disp)
     patch_size  = ck_args.get("patch_size", args.patch_size)
     agg_ch      = ck_args.get("agg_ch", 32)
     agg_depth   = ck_args.get("agg_depth", 3)
