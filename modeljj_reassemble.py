@@ -16,10 +16,23 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from PIL import Image
 from datetime import datetime, timezone, timedelta
+from upsampler import FinalUpsample2x
 
 # -----------------------------------------
 # Utils
 # -----------------------------------------
+def spatial_upsample_volume_4d(vol4d: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+    """
+    vol4d: [B, Cv, D, Hs, Ws]  (여기서 D는 disparity 축 길이)
+    target_hw: (Ht, Wt)  (공간(H,W)만 업샘플; D는 그대로 유지)
+    return: [B, Cv, D, Ht, Wt]
+    """
+    B, Cv, Dp, Hs, Ws = vol4d.shape
+    # 각 disparity slice별로 2D bilinear
+    v = vol4d.permute(0, 2, 1, 3, 4).contiguous().view(B*Dp, Cv, Hs, Ws)     # [B*D, Cv, Hs, Ws]
+    v = F.interpolate(v, size=target_hw, mode='bilinear', align_corners=False)
+    v = v.view(B, Dp, Cv, target_hw[0], target_hw[1]).permute(0, 2, 1, 3, 4).contiguous()
+    return v
 
 def assert_multiple(x, m, name="size"):
     if x % m != 0:
@@ -509,6 +522,16 @@ class StereoModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(128, (9)*(self.up_scale**2), kernel_size=1)
         )
+        
+        self.final_up = FinalUpsample2x(
+            dino_ch=embed_dim,        # DINO 채널(예: 768)
+            guide_ch=64,
+            fuse_ch=96,
+            refine_ch=64,
+            softmax_t=softarg_t,    # volume softmax 온도 동일 사용
+            res_limit=1.5,
+            use_edge_head=False     # 필요시 True로 켜고 보조손실 추가 가능
+        )
 
     @torch.no_grad()
     def _get_tokens(self, x: torch.Tensor) -> torch.Tensor:
@@ -572,9 +595,20 @@ class StereoModel(nn.Module):
         disp_half = convex_upsample_2d_scalar(disp_soft, upmask, self.up_scale)  # patch 단위
         disp_half_px = disp_half * float(self.patch / 2.0)  # half-res px 단위
 
-        return prob, disp_soft, {
+        # ----- (NEW) 최종 2× 업샘플 (½ → 1) -----
+        # 4D volume (logits) 를 H/2로 공간 업샘플 (disparity 축은 유지)
+        vol4d_half = spatial_upsample_volume_4d(refined_masked, target_hw=(H // 2, W // 2))  # [B,1,D+1,H/2,W/2]
+
+        # DINO(feature)도 H/2로 보간해 upsampler에 전달(선택)
+        dino_half = F.interpolate(FL, size=(H // 2, W // 2), mode='bilinear', align_corners=False)  # [B,feat_ch,H/2,W/2]
+
+        # 최종 업샘플 실행
+        disp_full, aux_up = self.final_up(disp_half, left, vol4d_half, dino_half)   # [B,1,H,W]
+        disp_full_px = disp_full * float(self.patch)  # 'patch' 단위를 원본 px로 변환
+
+        # aux 업데이트
+        aux = {
             "FL": FL, "FR": FR,
-            "left_tokens": left_tokens_n, "right_tokens": right_tokens_n,
             "raw_volume": raw_for_anchor,
             "refined_volume": refined,
             "mask": mask,
@@ -582,4 +616,22 @@ class StereoModel(nn.Module):
             "disp_wta": disp_wta,
             "disp_half": disp_half,
             "disp_half_px": disp_half_px,
+            # (NEW)
+            "disp_full": disp_full,
+            "disp_full_px": disp_full_px,
         }
+        aux.update(aux_up)
+
+        return prob, disp_soft, aux
+
+        # return prob, disp_soft, {
+        #     "FL": FL, "FR": FR,
+        #     "left_tokens": left_tokens_n, "right_tokens": right_tokens_n,
+        #     "raw_volume": raw_for_anchor,
+        #     "refined_volume": refined,
+        #     "mask": mask,
+        #     "refined_masked": refined_masked,
+        #     "disp_wta": disp_wta,
+        #     "disp_half": disp_half,
+        #     "disp_half_px": disp_half_px,
+        # }
