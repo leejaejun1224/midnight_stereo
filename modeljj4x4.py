@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from modern_decoder import ModernStereoDecoder
 
 
 # ---------------------------
@@ -403,7 +404,20 @@ class StereoModel(nn.Module):
         self.spx_source = spx_source
 
         # 2) 3D aggregation + soft-argmax (1/4 해상도)
-        self.agg  = CostAggregator3D(base_ch=agg_base_ch, depth=agg_depth, norm=norm)
+        # self.agg  = CostAggregator3D(base_ch=agg_base_ch, depth=agg_depth, norm=norm)
+
+
+        # modern decoder
+        self.agg = ModernStereoDecoder(
+            base_ch=agg_base_ch,       # 기존과 동일한 베이스 채널 사용 가능(기본 32)
+            depth=agg_depth,           # 2~4 지원; 기존 3 그대로 사용 권장
+            num_heads=4,               # H/4 해상도 기준 4~6 권장
+            mlp_ratio=2.0,
+            blocks_per_stage=(2,2,2,2),
+            drop_path=0.1,
+            norm="ln" if norm == "gn" else norm  # GN을 쓰시던 분도 LN 권장
+        )
+
         self.post = SoftAndArgMax(D=self.D, temperature=softarg_t)
 
         # 3) stem 피처 (full-res, quarter-res)
