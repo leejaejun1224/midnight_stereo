@@ -598,7 +598,7 @@ def main():
         cnn_center=True,
         spx_source="dino",
         # 1×1 conv/MLP 옵션
-        cv_fuse_out_ch=768,
+        cv_fuse_out_ch=384,
         cv_fuse_arch="conv1x1",            # 또는 "mlp"
 
         # 나머지 기존 설정
