@@ -547,35 +547,123 @@ def save_checkpoint(path: str, epoch: int, model: nn.Module,
         "time_saved": datetime.now().isoformat(),
     }
     torch.save(ckpt, path)
+import torch, warnings
+from torch import nn
 
+def smart_load_pretrained(model: nn.Module,
+                          state_dict: dict,
+                          prefix_to_strip: str = "",
+                          ignore_substrings = ("num_batches_tracked",),
+                          verbose: bool = True):
+    """
+    - ckpt의 키를 model과 최대한 매칭해서 로드.
+    - shape 다른 텐서는 자동 스킵.
+    - 'module.' 같은 prefix 제거 지원.
+    - BN의 num_batches_tracked 등은 무시.
+    """
+    own_state = model.state_dict()
+    loaded, skipped_name, skipped_shape = [], [], []
+
+    # 1) prefix 정리
+    def _fix_key(k):
+        if prefix_to_strip and k.startswith(prefix_to_strip):
+            return k[len(prefix_to_strip):]
+        return k
+
+    for k, v in list(state_dict.items()):
+        k2 = _fix_key(k)
+        # 2) 무시 키
+        if any(s in k2 for s in ignore_substrings):
+            continue
+        # 3) 존재 + shape 일치일 때만 채택
+        if k2 in own_state and own_state[k2].shape == v.shape:
+            own_state[k2].copy_(v)
+            loaded.append(k2)
+        else:
+            # shape 불일치 또는 키 미존재
+            if k2 in own_state:
+                skipped_shape.append((k2, tuple(v.shape), tuple(own_state[k2].shape)))
+            else:
+                skipped_name.append(k2)
+
+    if verbose:
+        print(f"[smart_load] 로드 성공 {len(loaded)}개")
+        if skipped_shape:
+            print(f"[smart_load] shape 불일치 {len(skipped_shape)}개 (ckpt → model):")
+            for n, s1, s2 in skipped_shape[:10]:
+                print(f"  - {n}: {s1} → {s2}")
+            if len(skipped_shape) > 10: print("  ...")
+        if skipped_name:
+            print(f"[smart_load] 모델에 없는 키 {len(skipped_name)}개 (예: {skipped_name[:5]})")
+
+    return loaded, skipped_name, skipped_shape
+
+
+@torch.no_grad()
+def init_new_modules(model: nn.Module, loaded_param_names: set):
+    """
+    ckpt에서 못 불러온(=새로 추가된) 파라미터만 안전 초기화.
+    - Conv/Linear: kaiming normal
+    - Norm/BN: weight=1, bias=0
+    - bias: 0
+    """
+    for name, m in model.named_modules():
+        for p_name, p in m.named_parameters(recurse=False):
+            full = f"{name}.{p_name}" if name else p_name
+            if full in loaded_param_names:  # 이미 ckpt에서 채워진 파라미터
+                continue
+            if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
+                if p_name == "weight":
+                    nn.init.kaiming_normal_(p)
+                elif p_name == "bias":
+                    nn.init.zeros_(p)
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                                nn.GroupNorm, nn.LayerNorm, nn.InstanceNorm1d,
+                                nn.InstanceNorm2d, nn.InstanceNorm3d)):
+                if p_name == "weight":
+                    nn.init.ones_(p)
+                elif p_name == "bias":
+                    nn.init.zeros_(p)
+            else:
+                # 기타 모듈은 bias만 0으로
+                if p_name == "bias":
+                    nn.init.zeros_(p)
 def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
                            scaler: torch.cuda.amp.GradScaler, device: torch.device) -> int:
-    """
-    Returns:
-      start_epoch: 재시작할 epoch (보통 ckpt_epoch+1)
-    """
     assert args.resume is not None and os.path.isfile(args.resume), f"checkpoint 없음: {args.resume}"
     print(f"[Resume] 로드: {args.resume}")
     ckpt = torch.load(args.resume, map_location="cpu")
 
-    # 1) 모델 가중치
-    strict = not args.resume_non_strict
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=strict)
-    if not strict:
-        if missing:
-            warnings.warn(f"[Resume] 누락된 키 {len(missing)}개: {missing[:10]}{' ...' if len(missing)>10 else ''}")
-        if unexpected:
-            warnings.warn(f"[Resume] 예기치 않은 키 {len(unexpected)}개: {unexpected[:10]}{' ...' if len(unexpected)>10 else ''}")
+    # === (A) 모델 가중치 로드 (안전 모드) ===
+    state = ckpt.get("model", ckpt)  # 방어적: 저장 방식 따라 키가 다를 수 있음
+    # DataParallel/DistributedDataParallel로 저장된 경우 'module.' prefix 제거
+    has_module_prefix = any(k.startswith("module.") for k in state.keys())
+    prefix = "module." if has_module_prefix else ""
+    loaded, skipped_name, skipped_shape = smart_load_pretrained(
+        model, state, prefix_to_strip=prefix, verbose=True
+    )
+    loaded_set = set(loaded)
 
-    # 2) 옵티마이저
+    # 새 모듈 안전 초기화
+    init_new_modules(model, loaded_set)
+
+    # === (B) 옵티마이저 ===
+    # 모델 파라미터 구성이 변했으면 예전 옵티마이저 state는 호환 안 됨(에러/불안정 유발)
     if (not args.resume_reset_optim) and ("optim" in ckpt):
-        optim.load_state_dict(ckpt["optim"])
-        _move_optimizer_state_to_device(optim, device)
-        print("[Resume] optimizer 상태 복구")
+        try:
+            optim.load_state_dict(ckpt["optim"])
+            # 디바이스로 옮기기
+            for s in optim.state.values():
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        s[k] = v.to(device)
+            print("[Resume] optimizer 상태 복구")
+        except Exception as e:
+            warnings.warn(f"[Resume] optimizer 복구 실패 → 초기화: {e}")
     else:
         print("[Resume] optimizer 상태 초기화(미복구)")
 
-    # 3) AMP GradScaler
+    # === (C) AMP GradScaler ===
     if scaler is not None and (not args.resume_reset_scaler) and ("scaler" in ckpt) and (ckpt["scaler"] is not None):
         try:
             scaler.load_state_dict(ckpt["scaler"])
@@ -585,7 +673,7 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
     else:
         print("[Resume] GradScaler 상태 초기화(미복구)")
 
-    # 4) RNG (선택 복구: 실험 재현성 필요 시)
+    # === (D) RNG(선택) ===
     try:
         if "rng_python" in ckpt: random.setstate(ckpt["rng_python"])
         if "rng_numpy"  in ckpt: np.random.set_state(ckpt["rng_numpy"])
