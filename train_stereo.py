@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import glob
 import argparse
@@ -141,7 +142,7 @@ class DirectionalRelScaleDispLoss(nn.Module):
                  sim_thr=0.75, sim_gamma=0.0, sample_k=512,
                  use_dynamic_thr=True, dynamic_q=0.7,
                  vert_margin=1.0, horiz_margin=0.0,
-                 lambda_v=1.0, lambda_h=0.0, huber_delta=1.0):
+                 lambda_v=1.0, lambda_h=1.0, huber_delta=1.0):
         super().__init__()
         self.vert_pairs = [(1,0), (-1,0)]
         self.hori_pairs = [(0,1), (0,-1)]
@@ -394,8 +395,8 @@ def warp_right_to_left_feat(FR, disp_patch, align_corners=True):
 
 def warp_right_to_left_image(imgR, disp_px, align_corners=True):
     """
-    imgR: [B,3,H,W] in [0,1], half 해상도
-    disp_px: [B,1,H,W] in 'half-resolution pixel' units
+    imgR: [B,3,H,W] in [0,1]  (입력 텐서 해상도와 동일)
+    disp_px: [B,1,H,W] in '해당 해상도 격자 기준' pixel units
     """
     B, C, H, W = imgR.shape
     yy, xx = torch.meshgrid(
@@ -688,6 +689,18 @@ def train(args):
                 imgL_half_01 = F.interpolate(imgL_01, scale_factor=0.5, mode='bilinear', align_corners=False)
                 imgR_half_01 = F.interpolate(imgR_01, scale_factor=0.5, mode='bilinear', align_corners=False)
 
+                # 원본 해상도에서도 photometric/smoothness를 사용할 경우만 보정 계산
+                need_full_enh = (args.w_photo_fullres > 0.0) or (args.w_smooth_fullres > 0.0)
+                if need_full_enh:
+                    imgL_full_enh_01 = enhance_batch_bgr_from_rgb01(
+                        imgL_01, enable=(not args.no_enhance),
+                        gamma=args.enhance_gamma,
+                        clahe_clip=args.enhance_clahe_clip,
+                        clahe_tile=args.enhance_clahe_tile
+                    )
+                else:
+                    imgL_full_enh_01 = None
+
             # enhance (좌 1/2 영상만 기준으로 사용)
             imgL_half_enh_01 = enhance_batch_bgr_from_rgb01(
                 imgL_half_01, enable=(not args.no_enhance),
@@ -703,7 +716,7 @@ def train(args):
                 mask_d   = aux["mask"]
                 refined_masked = aux["refined_masked"]
 
-                # 1/2 해상도 disparity (픽셀 단위)
+                # 1/2 해상도 disparity (픽셀 단위, 1/2 격자 기준 px)
                 disp_half_px = aux["disp_half_px"]
 
                 # === ROI 전영역(=1) 처리 ===
@@ -713,7 +726,7 @@ def train(args):
                 # 오른쪽 half 이미지를 좌로 warp
                 imgR_half_warp_01, valid_half = warp_right_to_left_image(imgR_half_01, disp_half_px)
 
-                # Losses
+                # Losses (원래 루틴)
                 loss_dir    = dir_loss_fn(disp_soft, FL, roi_patch) * args.w_dir
                 loss_hsharp = hsharp_fn(refined_masked, FL, roi_patch) * args.w_hsharp
                 loss_prob   = prob_cons_fn(prob, FL, roi_patch) * args.w_probcons
@@ -730,6 +743,39 @@ def train(args):
 
                 # Edge-aware smoothness on half res
                 loss_smooth = get_disparity_smooth_loss(disp_half_px, imgL_half_enh_01) * args.w_smooth
+
+                # ====== [추가] 원본 해상도 단위의 photometric/smoothness ======
+                loss_photo_full  = torch.tensor(0.0, device=device)
+                loss_smooth_full = torch.tensor(0.0, device=device)
+
+                if (args.w_photo_fullres > 0.0) or (args.w_smooth_fullres > 0.0):
+                    # 1) full-res disparity 선택: aux['disp_full_px'] 우선, 없으면 half→full 업샘플(+×2) fallback
+                    if "disp_full_px" in aux and aux["disp_full_px"] is not None:
+                        disp_full_px = aux["disp_full_px"]                         # [B,1,H,W], 원본 격자 px
+                    else:
+                        if args.fullres_disp_mode == "nearest":
+                            disp_full_grid = F.interpolate(disp_half_px, scale_factor=2.0, mode="nearest")
+                        else:
+                            disp_full_grid = F.interpolate(disp_half_px, scale_factor=2.0, mode="bilinear", align_corners=False)
+                        disp_full_px = disp_full_grid * 2.0                        # half-px → full-px 단위 변환
+
+                    # 2) Photometric (선택)
+                    if args.w_photo_fullres > 0.0:
+                        imgR_full_warp_01, valid_full = warp_right_to_left_image(imgR_01, disp_full_px)
+                        photo_full_map = photo_crit.simple_photometric_loss(
+                            imgL_full_enh_01 if imgL_full_enh_01 is not None else imgL_01,
+                            imgR_full_warp_01,
+                            weights=[args.photo_l1_w, args.photo_ssim_w]
+                        )  # [B,1,H,W]
+                        loss_photo_full = (photo_full_map * valid_full).sum() / (valid_full.sum() + 1e-6)
+                        loss_photo_full = loss_photo_full * args.w_photo_fullres
+
+                    # 3) Smoothness (선택)
+                    if args.w_smooth_fullres > 0.0:
+                        base_img_full = imgL_full_enh_01 if imgL_full_enh_01 is not None else imgL_01
+                        loss_smooth_full = get_disparity_smooth_loss(disp_full_px, base_img_full) * args.w_smooth_fullres
+                # ===========================================================
+
 
                 # === 1/8 seed prior 유틸 ===
                 with torch.no_grad():
@@ -764,7 +810,9 @@ def train(args):
                     anchor_mask=anchor_mask                 # [B,1,H/8,W/8]
                 ) * args.w_seed
 
-                loss = loss_dir + loss_photo + loss_smooth + loss_seed
+                # 총손실 (원본 해상도 항 추가 포함)
+                loss = loss_dir + loss_photo + loss_smooth + loss_seed \
+                       + loss_photo_full + loss_smooth_full
 
                 # === Sky loss (1/2 → 1/8 grid-ALL rule, disp=0 유도) ===
                 loss_sky, aux_sky = sky_loss(
@@ -800,6 +848,7 @@ def train(args):
                       f"prob={loss_prob.item():.4f}, ent={loss_ent.item():.4f}, "
                       f"anc={(loss_anchor/max(args.w_anchor,1e-9)).item():.4f}, rep={(loss_reproj/max(args.w_reproj,1e-9)).item():.4f}, "
                       f"photo={(loss_photo/max(args.w_photo,1e-9)).item():.4f}, smooth={(loss_smooth/max(args.w_smooth,1e-9)).item():.4f}, "
+                      f"photoF={(loss_photo_full/max(args.w_photo_fullres,1e-9)).item():.4f}, smoothF={(loss_smooth_full/max(args.w_smooth_fullres,1e-9)).item():.4f}, "
                       f"seed={(loss_seed/max(args.w_seed,1e-9)).item():.4f}, sky={(loss_sky/max(args.w_sky,1e-9)).item():.4f}) "
                       f"| mean|Δx| soft={soft_dx:.3f} wta={wta_dx:.3f}")
                 running = 0.0
@@ -868,11 +917,20 @@ def parse_args():
     p.add_argument("--anchor_topk",  type=int,   default=2)
     p.add_argument("--w_reproj",     type=float, default=1.0)
 
-    # Photometric / Smoothness
+    # Photometric / Smoothness (half)
     p.add_argument("--w_photo",    type=float, default=1.0)
     p.add_argument("--w_smooth",   type=float, default=0.01)
     p.add_argument("--photo_l1_w",   type=float, default=0.15)
     p.add_argument("--photo_ssim_w", type=float, default=0.85)
+
+    # ★ Photometric / Smoothness (full-res 추가)
+    p.add_argument("--w_photo_fullres",  type=float, default=0.0,
+                   help="원본 해상도 photometric loss 가중치 (0이면 비활성)")
+    p.add_argument("--w_smooth_fullres", type=float, default=0.0,
+                   help="원본 해상도 edge-aware smoothness 가중치 (0이면 비활성)")
+    p.add_argument("--fullres_disp_mode", type=str, default="bilinear",
+                   choices=["nearest","bilinear"],
+                   help="half→full disparity 업샘플 방식 (기본 bilinear)")
 
     # Enhance 옵션
     p.add_argument("--no_enhance", dest="no_enhance", action="store_true", help="저조도 보정 비활성화")
