@@ -3,7 +3,7 @@ import os
 import glob
 import argparse
 import random
-from typing import List
+from typing import List, Optional, Tuple, Dict
 
 import warnings
 import numpy as np
@@ -41,7 +41,7 @@ def stem(path: str) -> str:
 @torch.no_grad()
 def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
     """
-    x: [B,3,H,W], imagenet norm (mean,std) 적용된 텐서
+    x: [B,3,H,W], imagenet norm 적용
     return: [B,3,H,W] in [0,1]
     """
     mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)
@@ -57,7 +57,7 @@ def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
 class StereoFolderDataset(Dataset):
     """
     - left_dir/right_dir: 동일 파일명 매칭
-    - 마스크 관련 입력/처리는 모두 제거되었습니다.
+    - 마스크 관련 입력/처리는 제거
     """
     def __init__(self, left_dir: str, right_dir: str,
                  height: int = 384, width: int = 1224):
@@ -136,7 +136,7 @@ def rel_gate_from_sim_dynamic(sim_raw: torch.Tensor, min_vals: torch.Tensor, val
 
 class DirectionalRelScaleDispLoss(nn.Module):
     """
-    세로(±1): |Δ|<=1, 가로(±1): |Δ|<=0 (lambda_h 기본 0.0; 샤픈 가로 일관성으로 대체 권장)
+    세로(±1): |Δ|<=1, 가로(±1): |Δ|<=0
     """
     def __init__(self,
                  sim_thr=0.75, sim_gamma=0.0, sample_k=512,
@@ -512,6 +512,189 @@ def get_disparity_smooth_loss(disp, img):
 
 
 # ---------------------------
+# (NEW) MS2 실시간 정량평가 유틸
+# ---------------------------
+
+def _safe_np_load(path: str):
+    if not path or not os.path.isfile(path):
+        return None
+    obj = np.load(path, allow_pickle=True)
+    if isinstance(obj, np.lib.npyio.NpzFile):
+        return {k: obj[k] for k in obj.files}
+    try:
+        if hasattr(obj, "item"):
+            return obj.item()
+    except Exception:
+        pass
+    return obj
+
+def _normalize_unit_m(b: float) -> float:
+    # 2m 이상 값이 들어오면 mm로 보고 m로 변환
+    return b / 1000.0 if abs(b) > 2.0 else b
+
+def read_fx_baseline_rgb(intrinsic_left_npy: Optional[str],
+                         calib_npy: Optional[str]) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    intrinsic_left_npy(3x3)와 calib_npy(dict)에서 fx(px), baseline(m) 추출
+    """
+    src = []
+    fx, B = None, None
+
+    # fx from intrinsic
+    if intrinsic_left_npy:
+        K = _safe_np_load(intrinsic_left_npy)
+        if isinstance(K, dict):
+            for k in ["K", "K_left", "K_rgbL", "intrinsic", "intrinsic_left"]:
+                if k in K and isinstance(K[k], np.ndarray) and K[k].shape[:2] == (3,3):
+                    fx = float(K[k][0,0]); src.append(f"K:{intrinsic_left_npy}"); break
+        elif isinstance(K, np.ndarray) and K.shape[:2] == (3,3):
+            fx = float(K[0,0]); src.append(f"K:{intrinsic_left_npy}")
+
+    # baseline from calib
+    C = _safe_np_load(calib_npy) if calib_npy else None
+    if isinstance(C, dict):
+        # 1) 직접 T_lr (4x4)
+        for key in ["T_lr", "T_left_right", "T_rgb_lr"]:
+            if key in C and isinstance(C[key], np.ndarray) and C[key].shape == (4,4):
+                B = _normalize_unit_m(abs(float(C[key][0,3]))); src.append(f"Tlr:{calib_npy}"); break
+        # 2) 좌우 translation
+        if B is None and ("T_rgbL" in C and "T_rgbR" in C):
+            TL = np.asarray(C["T_rgbL"]).reshape(3)
+            TR = np.asarray(C["T_rgbR"]).reshape(3)
+            B = _normalize_unit_m(abs(float(TR[0] - TL[0]))); src.append(f"T_LR:{calib_npy}")
+        # 3) P행렬만 있을 때: rectified 가정 (P_right[0,3] = -fx * B)
+        if B is None:
+            P_left = None; P_right = None
+            for k in ["P_left", "P0", "P2", "proj_left", "P_rgbL"]:
+                if k in C and isinstance(C[k], np.ndarray) and C[k].size >= 12:
+                    P_left = C[k].reshape(3,4); break
+            for k in ["P_right", "P1", "P3", "proj_right", "P_rgbR"]:
+                if k in C and isinstance(C[k], np.ndarray) and C[k].size >= 12:
+                    P_right = C[k].reshape(3,4); break
+            if P_left is not None and P_right is not None:
+                fx_from_P = float(P_left[0,0])
+                fx_eff = fx_from_P if fx_from_P > 0 else (fx if fx else 0.0)
+                if fx_eff > 0:
+                    B = _normalize_unit_m(abs(float(-P_right[0,3] / fx_eff))); src.append(f"P:{calib_npy}")
+
+    return fx, B, "+".join(src) if src else "not_found"
+
+def _first_existing(path_without_ext: str, exts=(".png",".tiff",".tif",".exr",".npy")) -> Optional[str]:
+    for e in exts:
+        p = path_without_ext + e
+        if os.path.isfile(p): return p
+    g = glob.glob(path_without_ext + ".*")
+    return g[0] if len(g) else None
+
+@torch.no_grad()
+def load_ms2_gt_depth_batch(names: List[str], gt_depth_dir: str, scale: float,
+                            target_hw: Tuple[int,int], device: torch.device) -> Optional[torch.Tensor]:
+    """uint16 PNG( depth[m]*scale ) 또는 npy(exr) → [B,1,H,W] (meters), nearest resize"""
+    if not gt_depth_dir:
+        return None
+    Ht, Wt = target_hw
+    outs = []
+    for n in names:
+        p = _first_existing(os.path.join(gt_depth_dir, os.path.splitext(n)[0]))
+        if p is None:
+            raise FileNotFoundError(f"[GT] depth not found for {n} under {gt_depth_dir}")
+        if p.endswith(".npy"):
+            arr = np.load(p).astype(np.float32)
+        else:
+            arr = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                raise FileNotFoundError(f"[GT] failed to read: {p}")
+            if arr.ndim == 3:
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+            arr = arr.astype(np.float32)
+            # PNG는 depth[m]*scale
+            arr = arr / max(scale, 1e-6)
+        if arr.shape != (Ht,Wt):
+            arr = cv2.resize(arr, (Wt,Ht), interpolation=cv2.INTER_NEAREST)
+        outs.append(torch.from_numpy(arr)[None,None])  # [1,1,H,W]
+    return torch.cat(outs, dim=0).to(device)
+
+@torch.no_grad()
+def disparity_to_depth(disp_px: torch.Tensor, focal_px: float, baseline_m: float, eps: float = 1e-6) -> torch.Tensor:
+    return (focal_px * baseline_m) / disp_px.clamp_min(eps)
+
+@torch.no_grad()
+def compute_ms2_disparity_metrics(pred_disp: torch.Tensor,
+                                  gt_disp: torch.Tensor,
+                                  valid: torch.Tensor) -> Dict[str, float]:
+    """
+    EPE, D1-all(AND: >3px & >5%), >1px, >2px
+    pred_disp, gt_disp, valid: [B,1,H,W]
+    """
+    eps = 1e-6
+    err = (pred_disp - gt_disp).abs()
+    v = (valid > 0.5).float()
+    denom = v.sum().clamp_min(eps)
+
+    epe = (err * v).sum() / denom
+
+    thr = torch.maximum(torch.tensor(3.0, device=gt_disp.device, dtype=gt_disp.dtype),
+                        0.05 * gt_disp.abs())
+    d1_mask = ((err > 3.0) & ((err / gt_disp.clamp_min(eps)) > 0.05)) * (v > 0.5)
+    d1 = d1_mask.sum().float() / denom * 100.0
+
+    bad1 = ((err > 1.0).float() * v).sum() / denom * 100.0
+    bad2 = ((err > 2.0).float() * v).sum() / denom * 100.0
+
+    return {"EPE": epe.item(), "D1_all": d1.item(), "> 1px": bad1.item(), "> 2px": bad2.item(), "valid_px": denom.item()}
+
+@torch.no_grad()
+def compute_depth_metrics(pred_depth_m: torch.Tensor,
+                          gt_depth_m: torch.Tensor,
+                          valid: torch.Tensor) -> Dict[str, float]:
+    """AbsRel, RMSE, δ<1.25 (필수 세트)"""
+    eps = 1e-6
+    v = (valid > 0.5).float()
+    pd = pred_depth_m.clamp_min(eps)
+    gd = gt_depth_m.clamp_min(eps)
+    denom = v.sum().clamp_min(eps)
+
+    abs_rel = ((pd - gd).abs() / gd * v).sum() / denom
+    rmse    = torch.sqrt((((pd - gd) ** 2) * v).sum() / denom)
+    ratio   = torch.maximum(pd / gd, gd / pd)
+    d1      = ((ratio < 1.25).float() * v).sum() / denom
+
+    return {"AbsRel": abs_rel.item(), "RMSE": rmse.item(), "δ<1.25": d1.item(), "valid_px": denom.item()}
+
+@torch.no_grad()
+def compute_bin_weighted_depth(pred_depth_m: torch.Tensor,
+                               gt_depth_m: torch.Tensor,
+                               valid: torch.Tensor,
+                               max_depth_m: float = 50.0,
+                               num_bins: int = 5) -> Dict[str, float]:
+    """0~max_depth_m 구간을 num_bins로 등분, bin별 metric 평균"""
+    edges = torch.linspace(0.0, max_depth_m, steps=num_bins + 1, device=pred_depth_m.device)
+    bins = [(edges[i], edges[i+1]) for i in range(num_bins)]
+    acc_absrel = 0.0; acc_rmse = 0.0; acc_d1 = 0.0; cnt = 0
+    for lo, hi in bins:
+        m = (valid > 0.5) & (gt_depth_m >= lo) & (gt_depth_m < hi)
+        if m.sum() < 1:
+            continue
+        sub = compute_depth_metrics(pred_depth_m, gt_depth_m, m.float())
+        acc_absrel += sub["AbsRel"]; acc_rmse += sub["RMSE"]; acc_d1 += sub["δ<1.25"]; cnt += 1
+    if cnt == 0:
+        return {"W/AbsRel": float("nan"), "W/RMSE": float("nan"), "W/δ<1.25": float("nan")}
+    return {"W/AbsRel": acc_absrel/cnt, "W/RMSE": acc_rmse/cnt, "W/δ<1.25": acc_d1/cnt}
+
+def _fmt_disp(m: Dict[str,float]) -> str:
+    if not m: return ""
+    return f"EPE={m['EPE']:.3f}  D1={m['D1_all']:.2f}%  >1px={m['> 1px']:.2f}%  >2px={m['> 2px']:.2f}%"
+
+def _fmt_depth(m: Dict[str,float]) -> str:
+    if not m: return ""
+    return f"AbsRel={m['AbsRel']:.3f}  RMSE={m['RMSE']:.3f}  δ1={m['δ<1.25']:.3f}"
+
+def _fmt_depth_w(m: Dict[str,float]) -> str:
+    if not m: return ""
+    return f"W/AbsRel={m['W/AbsRel']:.3f}  W/RMSE={m['W/RMSE']:.3f}  W/δ1={m['W/δ<1.25']:.3f}"
+
+
+# ---------------------------
 # 학습 루프
 # ---------------------------
 
@@ -547,6 +730,7 @@ def save_checkpoint(path: str, epoch: int, model: nn.Module,
         "time_saved": datetime.now().isoformat(),
     }
     torch.save(ckpt, path)
+
 import torch, warnings
 from torch import nn
 
@@ -628,6 +812,7 @@ def init_new_modules(model: nn.Module, loaded_param_names: set):
                 # 기타 모듈은 bias만 0으로
                 if p_name == "bias":
                     nn.init.zeros_(p)
+
 def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
                            scaler: torch.cuda.amp.GradScaler, device: torch.device) -> int:
     assert args.resume is not None and os.path.isfile(args.resume), f"checkpoint 없음: {args.resume}"
@@ -648,7 +833,6 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
     init_new_modules(model, loaded_set)
 
     # === (B) 옵티마이저 ===
-    # 모델 파라미터 구성이 변했으면 예전 옵티마이저 state는 호환 안 됨(에러/불안정 유발)
     if (not args.resume_reset_optim) and ("optim" in ckpt):
         try:
             optim.load_state_dict(ckpt["optim"])
@@ -693,6 +877,19 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
 def train(args):
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- (NEW) fx/baseline 자동 로딩 ---
+    # 우선순위: args.focal_px/baseline_m > 파일에서 자동 추출
+    fx, B, src = read_fx_baseline_rgb(
+        intrinsic_left_npy=getattr(args, "K_left_npy", None),
+        calib_npy=getattr(args, "calib_npy", None)
+    )
+    if getattr(args, "focal_px", 0.0) <= 0.0 and fx is not None:
+        args.focal_px = float(fx)
+    if getattr(args, "baseline_m", 0.0) <= 0.0 and B is not None:
+        args.baseline_m = float(B)
+    if getattr(args, "realtime_test", False):
+        print(f"[Calib] fx(px)={getattr(args,'focal_px',0.0):.6f}  baseline(m)={getattr(args,'baseline_m',0.0):.6f}  src={src}")
 
     dataset = StereoFolderDataset(args.left_dir, args.right_dir,
                                   height=args.height, width=args.width)
@@ -836,20 +1033,17 @@ def train(args):
                 loss_photo_full  = torch.tensor(0.0, device=device)
                 loss_smooth_full = torch.tensor(0.0, device=device)
 
-                if (args.w_photo_fullres > 0.0) or (args.w_smooth_fullres > 0.0):
-                    # 1) full-res disparity 선택: aux['disp_full_px'] 우선, 없으면 half→full 업샘플(+×2) fallback
-                    if "disp_full_px" in aux and aux["disp_full_px"] is not None:
-                        disp_full_px = aux["disp_full_px"]                         # [B,1,H,W], 원본 격자 px
-                    else:
-                        if args.fullres_disp_mode == "nearest":
-                            disp_full_grid = F.interpolate(disp_half_px, scale_factor=2.0, mode="nearest")
-                        else:
-                            disp_full_grid = F.interpolate(disp_half_px, scale_factor=2.0, mode="bilinear", align_corners=False)
-                        disp_full_px = disp_full_grid * 2.0                        # half-px → full-px 단위 변환
+                # (평가용) full-res disparity 확보 (항상 생성)
+                if "disp_full_px" in aux and aux["disp_full_px"] is not None:
+                    disp_full_px_eval = aux["disp_full_px"]                         # [B,1,H,W]
+                else:
+                    disp_full_grid = F.interpolate(disp_half_px, scale_factor=2.0, mode="bilinear", align_corners=False)
+                    disp_full_px_eval = disp_full_grid * 2.0                        # half-px → full-px
 
-                    # 2) Photometric (선택)
+                if (args.w_photo_fullres > 0.0) or (args.w_smooth_fullres > 0.0):
+                    # photometric (full)
                     if args.w_photo_fullres > 0.0:
-                        imgR_full_warp_01, valid_full = warp_right_to_left_image(imgR_01, disp_full_px)
+                        imgR_full_warp_01, valid_full = warp_right_to_left_image(imgR_01, disp_full_px_eval)
                         photo_full_map = photo_crit.simple_photometric_loss(
                             imgL_full_enh_01 if imgL_full_enh_01 is not None else imgL_01,
                             imgR_full_warp_01,
@@ -858,12 +1052,11 @@ def train(args):
                         loss_photo_full = (photo_full_map * valid_full).sum() / (valid_full.sum() + 1e-6)
                         loss_photo_full = loss_photo_full * args.w_photo_fullres
 
-                    # 3) Smoothness (선택)
+                    # smoothness (full)
                     if args.w_smooth_fullres > 0.0:
                         base_img_full = imgL_full_enh_01 if imgL_full_enh_01 is not None else imgL_01
-                        loss_smooth_full = get_disparity_smooth_loss(disp_full_px, base_img_full) * args.w_smooth_fullres
+                        loss_smooth_full = get_disparity_smooth_loss(disp_full_px_eval, base_img_full) * args.w_smooth_fullres
                 # ===========================================================
-
 
                 # === 1/8 seed prior 유틸 ===
                 with torch.no_grad():
@@ -906,8 +1099,8 @@ def train(args):
                 loss_sky, aux_sky = sky_loss(
                     refined_logits_masked=aux["refined_masked"],
                     disp_half_px=aux["disp_half_px"],
-                    roi_half=None,          # ROI 사용 안 함
-                    roi_patch=None,         # ROI 사용 안 함
+                    roi_half=None,
+                    roi_patch=None,
                     names=names,
                     step=(epoch-1)*len(loader)+it
                 )
@@ -930,6 +1123,55 @@ def train(args):
                     disp_wta = aux["disp_wta"]
                     soft_dx = (roi_patch * (disp_soft - shift_with_mask(disp_soft,0,1)[0]).abs()).sum() / (roi_patch.sum()+1e-6)
                     wta_dx  = (roi_patch * (disp_wta  - shift_with_mask(disp_wta, 0,1)[0]).abs()).sum() / (roi_patch.sum()+1e-6)
+
+                    # --- (NEW) Realtime MS2 metrics ---
+                    extra_eval = ""
+                    if getattr(args, "realtime_test", False) and getattr(args, "gt_depth_dir", None):
+                        # GT depth 로드 (현재 입력 해상도 기준으로 nearest 리사이즈)
+                        H, W = imgL.shape[-2], imgL.shape[-1]
+                        gt_depth = load_ms2_gt_depth_batch(
+                            names=names,
+                            gt_depth_dir=args.gt_depth_dir,
+                            scale=args.gt_depth_scale,
+                            target_hw=(H,W),
+                            device=device
+                        )
+                        if gt_depth is not None:
+                            valid = (gt_depth > 0).float()
+
+                            # 예측 disp (full-res)
+                            pred_disp_px = disp_full_px_eval
+
+                            # Stereo 지표 (GT depth → disp 변환, fx/B 필요)
+                            disp_msg = ""
+                            has_fb = (getattr(args, "focal_px", 0.0) > 0.0) and (getattr(args, "baseline_m", 0.0) > 0.0)
+                            if has_fb:
+                                gt_disp_px = (args.focal_px * args.baseline_m) / gt_depth.clamp_min(1e-6)
+                                disp_metrics = compute_ms2_disparity_metrics(pred_disp_px, gt_disp_px, valid)
+                                disp_msg = "[Disp] " + _fmt_disp(disp_metrics)
+
+                                # Depth 지표 (pred depth = fx*B/disp)
+                                pred_depth_m = disparity_to_depth(pred_disp_px, args.focal_px, args.baseline_m)
+                                depth_metrics = compute_depth_metrics(pred_depth_m, gt_depth, valid)
+                                depth_msg = "[Depth] " + _fmt_depth(depth_metrics)
+
+                                # Bin-weighted (선택)
+                                depth_w = {}
+                                if getattr(args, "eval_num_bins", 0) > 0 and getattr(args, "eval_max_depth_m", 0.0) > 0.0:
+                                    depth_w = compute_bin_weighted_depth(
+                                        pred_depth_m, gt_depth, valid,
+                                        max_depth_m=args.eval_max_depth_m,
+                                        num_bins=args.eval_num_bins
+                                    )
+                                depth_w_msg = "[Depth-W] " + _fmt_depth_w(depth_w) if depth_w else ""
+
+                                parts = [s for s in [disp_msg, depth_msg, depth_w_msg] if s]
+                                if parts:
+                                    extra_eval = " || " + "  ".join(parts)
+                            else:
+                                extra_eval = " || [Calib] fx/baseline 미설정 → stereo/depth metric 생략"
+                    # ----------------------------------
+
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} !!"
                       f"(dir={loss_dir.item():.4f}, hsharp={loss_hsharp.item():.4f}, "
@@ -938,7 +1180,9 @@ def train(args):
                       f"photo={(loss_photo/max(args.w_photo,1e-9)).item():.4f}, smooth={(loss_smooth/max(args.w_smooth,1e-9)).item():.4f}, "
                       f"photoF={(loss_photo_full/max(args.w_photo_fullres,1e-9)).item():.4f}, smoothF={(loss_smooth_full/max(args.w_smooth_fullres,1e-9)).item():.4f}, "
                       f"seed={(loss_seed/max(args.w_seed,1e-9)).item():.4f}, sky={(loss_sky/max(args.w_sky,1e-9)).item():.4f}) "
-                      f"| mean|Δx| soft={soft_dx:.3f} wta={wta_dx:.3f}")
+                      f"| mean|Δx| soft={soft_dx:.3f} wta={wta_dx:.3f}"
+                      f"{extra_eval}"
+                )
                 running = 0.0
 
         if args.save_dir:
@@ -961,7 +1205,7 @@ def parse_args():
     p.add_argument("--right_dir", type=str, required=True)
     p.add_argument("--height", type=int, default=384)
     p.add_argument("--width",  type=int, default=1224)
-    # ★ mask_dir 옵션 완전 제거됨
+    # ★ mask_dir 옵션 제거
 
     # 모델/학습
     p.add_argument("--max_disp_px", type=int, default=88)
@@ -1060,6 +1304,29 @@ def parse_args():
     # Sky loss weight
     p.add_argument("--w_sky", type=float, default=0.0,
                    help="sky weight for SkyZeroLoss")
+
+    # ---------- (NEW) Realtime evaluation ----------
+    p.add_argument("--realtime_test", action="store_true",
+                   help="배치별 실시간 정량평가(EPE/D1/>kpx + Depth/Weighted) 출력")
+    p.add_argument("--gt_disp_dir", type=str, default=None,
+                   help="(선택) GT disparity 디렉토리 (잘 쓰지 않음; 보통 depth GT 사용)")
+    p.add_argument("--gt_depth_dir", type=str, default=None,
+                   help="GT depth 디렉토리 (PNG: depth[m]*scale, 또는 NPY/EXR)")
+    p.add_argument("--gt_disp_scale", type=float, default=1.0,
+                   help="GT disparity 스케일 나눗값")
+    p.add_argument("--gt_depth_scale", type=float, default=256.0,
+                   help="GT depth PNG가 depth[m]*scale 로 저장된 경우 scale (MS2=256)")
+    p.add_argument("--eval_num_bins", type=int, default=5,
+                   help="bin-weighted depth metric bin 수 (0이면 비활성)")
+    p.add_argument("--eval_max_depth_m", type=float, default=50.0,
+                   help="bin-weighted depth metric 최대 거리(m)")
+
+    # 캘리브(자동로딩/직접입력)
+    p.add_argument("--calib_npy", type=str, default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/calib.npy")
+    p.add_argument("--K_left_npy", type=str, default="/home/jaejun/dataset/MS2/intrinsic_left.npy")
+    p.add_argument("--T_lr_npy", type=str, default=None, help="4x4 extrinsic .npy (left->right)")
+    p.add_argument("--focal_px", type=float, default=764.5138549804688)
+    p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
 
     return p.parse_args()
 
