@@ -459,7 +459,7 @@ def run_one(model, left_path, right_path, args, device, patch_size, max_disp_px)
         "badmask_full": badmask_full,   # 추가
         "max_disp_px": max_disp_px,
         "patch_size": patch_size,
-        "disp_full_px": aux["disp_full_px"][0, 0].cpu().numpy().astype(np.float32)
+        # "disp_full_px": aux["disp_full_px"][0, 0].cpu().numpy().astype(np.float32)
         
     }
 
@@ -566,7 +566,7 @@ def main():
         # 컬러맵 PNG (컬러바 포함) — 여기서 흰색 마스킹 반영
         if args.save_color and HAS_CV2:
             cm_with_bar = colorize_with_vertical_bar(
-                out["disp_full_px"],
+                out["disp_px_half"],
                 vmin=args.color_min, vmax=args.color_max,
                 pad=args.colorbar_pad, bar_width=args.colorbar_width, label_width=args.colorbar_label_width,
                 tick_step=args.colorbar_tick_step, tick_count=args.colorbar_tick_count,

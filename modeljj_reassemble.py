@@ -523,15 +523,15 @@ class StereoModel(nn.Module):
             nn.Conv2d(128, (9)*(self.up_scale**2), kernel_size=1)
         )
         
-        self.final_up = FinalUpsample2x(
-            dino_ch=reassem_ch,        # DINO 채널(예: 768)
-            guide_ch=64,
-            fuse_ch=96,
-            refine_ch=64,
-            softmax_t=softarg_t,    # volume softmax 온도 동일 사용
-            res_limit=1.5,
-            use_edge_head=False     # 필요시 True로 켜고 보조손실 추가 가능
-        )
+        # self.final_up = FinalUpsample2x(
+        #     dino_ch=reassem_ch,        # DINO 채널(예: 768)
+        #     guide_ch=64,
+        #     fuse_ch=96,
+        #     refine_ch=64,
+        #     softmax_t=softarg_t,    # volume softmax 온도 동일 사용
+        #     res_limit=1.5,
+        #     use_edge_head=False     # 필요시 True로 켜고 보조손실 추가 가능
+        # )
 
     @torch.no_grad()
     def _get_tokens(self, x: torch.Tensor) -> torch.Tensor:
@@ -603,8 +603,8 @@ class StereoModel(nn.Module):
         dino_half = F.interpolate(FL, size=(H // 2, W // 2), mode='bilinear', align_corners=False)  # [B,feat_ch,H/2,W/2]
 
         # 최종 업샘플 실행
-        disp_full, aux_up = self.final_up(disp_half, left, vol4d_half, dino_half)   # [B,1,H,W]
-        disp_full_px = disp_full * float(self.patch)  # 'patch' 단위를 원본 px로 변환
+        # disp_full, aux_up = self.final_up(disp_half, left, vol4d_half, dino_half)   # [B,1,H,W]
+        # disp_full_px = disp_full * float(self.patch)  # 'patch' 단위를 원본 px로 변환
 
         # aux 업데이트
         aux = {
@@ -617,10 +617,10 @@ class StereoModel(nn.Module):
             "disp_half": disp_half,
             "disp_half_px": disp_half_px,
             # (NEW)
-            "disp_full": disp_full,
-            "disp_full_px": disp_full_px,
+            # "disp_full": disp_full,
+            # "disp_full_px": disp_full_px,
         }
-        aux.update(aux_up)
+        # aux.update(aux_up)
 
         return prob, disp_soft, aux
 
