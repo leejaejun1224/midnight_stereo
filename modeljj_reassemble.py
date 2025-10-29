@@ -524,7 +524,7 @@ class StereoModel(nn.Module):
         )
         
         self.final_up = FinalUpsample2x(
-            dino_ch=embed_dim,        # DINO 채널(예: 768)
+            dino_ch=reassem_ch,        # DINO 채널(예: 768)
             guide_ch=64,
             fuse_ch=96,
             refine_ch=64,
