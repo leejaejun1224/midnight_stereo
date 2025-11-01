@@ -3,7 +3,7 @@ import os
 import glob
 import argparse
 import random
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 
 import warnings
 import numpy as np
@@ -470,7 +470,7 @@ class SSIM(nn.Module):
         self.mu_y_pool   = nn.AvgPool2d(3, 1)
         self.sig_x_pool  = nn.AvgPool2d(3, 1)
         self.sig_y_pool  = nn.AvgPool2d(3, 1)
-        self.sig_xy_pool = nn.AvgPool2d(3, 1)
+        self.sig_xy_pool = nn.AvgPool2d(3,  1)
         self.refl = nn.ReflectionPad2d(1)
         self.C1 = 0.01 ** 2
         self.C2 = 0.03 ** 2
@@ -695,7 +695,7 @@ def _fmt_depth_w(m: Dict[str,float]) -> str:
 
 
 # ---------------------------
-# 학습 루프
+# 학습 루프 (프리트레인 동결 지원 추가)
 # ---------------------------
 
 def build_optimizer(params, name='adamw', lr=1e-3, weight_decay=1e-2):
@@ -813,8 +813,31 @@ def init_new_modules(model: nn.Module, loaded_param_names: set):
                 if p_name == "bias":
                     nn.init.zeros_(p)
 
-def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
-                           scaler: torch.cuda.amp.GradScaler, device: torch.device) -> int:
+def freeze_params_by_name(model: nn.Module, names_set: Set[str], verbose: bool = True):
+    """
+    names_set(ckpt로부터 로드된 파라미터 이름들)에 해당하는 파라미터만 동결(requires_grad=False)
+    """
+    num_tensors = 0
+    num_elems_frozen = 0
+    for n, p in model.named_parameters():
+        if n in names_set:
+            p.requires_grad = False
+            num_tensors += 1
+            num_elems_frozen += p.numel()
+    if verbose:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"[Freeze] 동결 텐서 수={num_tensors}, 동결 파라미터 수={num_elems_frozen:,}")
+        print(f"[Freeze] 학습 가능 파라미터={trainable:,} / 전체={total:,}")
+
+def resume_from_checkpoint(args,
+                           model: nn.Module,
+                           device: torch.device) -> Tuple[int, Set[str], Optional[dict]]:
+    """
+    체크포인트로부터 모델 가중치만 로드하고, 로드에 성공한 파라미터 이름 집합을 반환.
+    - 옵티마이저/스케일러는 여기서 로드하지 않음 (동결 여부에 따라 이후 처리)
+    - --pretrained_freeze=True이면 start_epoch는 1부터 시작하도록 리셋
+    """
     assert args.resume is not None and os.path.isfile(args.resume), f"checkpoint 없음: {args.resume}"
     print(f"[Resume] 로드: {args.resume}")
     ckpt = torch.load(args.resume, map_location="cpu")
@@ -832,32 +855,7 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
     # 새 모듈 안전 초기화
     init_new_modules(model, loaded_set)
 
-    # === (B) 옵티마이저 ===
-    if (not args.resume_reset_optim) and ("optim" in ckpt):
-        try:
-            optim.load_state_dict(ckpt["optim"])
-            # 디바이스로 옮기기
-            for s in optim.state.values():
-                for k, v in s.items():
-                    if isinstance(v, torch.Tensor):
-                        s[k] = v.to(device)
-            print("[Resume] optimizer 상태 복구")
-        except Exception as e:
-            warnings.warn(f"[Resume] optimizer 복구 실패 → 초기화: {e}")
-    else:
-        print("[Resume] optimizer 상태 초기화(미복구)")
-
-    # === (C) AMP GradScaler ===
-    if scaler is not None and (not args.resume_reset_scaler) and ("scaler" in ckpt) and (ckpt["scaler"] is not None):
-        try:
-            scaler.load_state_dict(ckpt["scaler"])
-            print("[Resume] GradScaler 상태 복구")
-        except Exception as e:
-            warnings.warn(f"[Resume] GradScaler 상태 복구 실패 → 무시: {e}")
-    else:
-        print("[Resume] GradScaler 상태 초기화(미복구)")
-
-    # === (D) RNG(선택) ===
+    # === (B) RNG(선택) ===
     try:
         if "rng_python" in ckpt: random.setstate(ckpt["rng_python"])
         if "rng_numpy"  in ckpt: np.random.set_state(ckpt["rng_numpy"])
@@ -869,9 +867,12 @@ def resume_from_checkpoint(args, model: nn.Module, optim: torch.optim.Optimizer,
         warnings.warn(f"[Resume] RNG state 복구 실패 → 무시: {e}")
 
     last_epoch = int(ckpt.get("epoch", 0))
-    start_epoch = last_epoch + 1
-    print(f"[Resume] 마지막 epoch={last_epoch} → 재시작 epoch={start_epoch}")
-    return start_epoch
+    start_epoch = 1 if getattr(args, "pretrained_freeze", False) else last_epoch + 1
+    print(f"[Resume] 마지막 epoch={last_epoch} → 재시작 epoch={start_epoch} "
+          f"({'동결모드: epoch 리셋' if getattr(args,'pretrained_freeze',False) else '연속학습'})")
+
+    # 동결은 train()에서 옵티마이저 생성 전에 수행
+    return start_epoch, loaded_set, ckpt
 
 
 def train(args):
@@ -879,7 +880,6 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- (NEW) fx/baseline 자동 로딩 ---
-    # 우선순위: args.focal_px/baseline_m > 파일에서 자동 추출
     fx, B, src = read_fx_baseline_rgb(
         intrinsic_left_npy=getattr(args, "K_left_npy", None),
         calib_npy=getattr(args, "calib_npy", None)
@@ -938,16 +938,45 @@ def train(args):
         max_disp_px=args.max_disp_px,
         patch_size=args.patch_size).to(device)
 
+    # ---[ Resume + Pretrained Freeze 처리 ]---
+    start_epoch = 1
+    loaded_set: Set[str] = set()
+    ckpt = None
+    if args.resume is not None:
+        start_epoch, loaded_set, ckpt = resume_from_checkpoint(args, model, device)
+        # 동결 옵션이면: ckpt로부터 로드된 파라미터만 동결
+        if args.pretrained_freeze:
+            freeze_params_by_name(model, loaded_set, verbose=True)
+
+    # === 옵티마이저/스케일러는 동결/미동결 결정 후 생성 ===
     optim = build_optimizer([p for p in model.parameters() if p.requires_grad],
                             name=args.optim, lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
-    # ---[ Resume ]---
-    if args.resume is not None:
-        start_epoch = resume_from_checkpoint(args, model, optim, scaler, device)
-    else:
-        start_epoch = 1
-        
+    # === 옵티마이저/스케일러 상태 복구 (동결 모드가 아닐 때만) ===
+    if (ckpt is not None) and (not args.pretrained_freeze):
+        # 옵티마이저
+        if (not args.resume_reset_optim) and ("optim" in ckpt):
+            try:
+                optim.load_state_dict(ckpt["optim"])
+                _move_optimizer_state_to_device(optim, device)
+                print("[Resume] optimizer 상태 복구")
+            except Exception as e:
+                warnings.warn(f"[Resume] optimizer 복구 실패 → 초기화: {e}")
+        else:
+            print("[Resume] optimizer 상태 초기화(미복구)")
+        # AMP GradScaler
+        if scaler is not None and (not args.resume_reset_scaler) and ("scaler" in ckpt) and (ckpt["scaler"] is not None):
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+                print("[Resume] GradScaler 상태 복구")
+            except Exception as e:
+                warnings.warn(f"[Resume] GradScaler 상태 복구 실패 → 무시: {e}")
+        else:
+            print("[Resume] GradScaler 상태 초기화(미복구)")
+    elif args.pretrained_freeze and ckpt is not None:
+        print("[Resume] pretrained_freeze=True → optimizer/scaler 상태 복구 생략 (파라미터 구성 변경)")
+
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
         log_path = save_args_as_text(
@@ -1280,6 +1309,10 @@ def parse_args():
                    help="체크포인트의 optimizer 상태를 무시하고 현재 설정으로 재시작")
     p.add_argument("--resume_reset_scaler", action="store_true",
                    help="체크포인트의 GradScaler 상태를 무시")
+
+    # ★★★ 프리트레인 동결 옵션 추가 ★★★
+    p.add_argument("--pretrained_freeze", action="store_true",
+                   help="체크포인트에서 불러온(이미 학습된) 파라미터는 동결하고, 새 모듈만 학습")
 
     # 로깅/저장
     p.add_argument("--log_every", type=int, default=10)
