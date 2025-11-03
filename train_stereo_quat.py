@@ -522,7 +522,7 @@ def get_args():
     p.add_argument("--photo_ssim_w",     type=float, default=0.85)
 
     # DirectionalRelScaleDispLoss 하이퍼 (cossim + 세로 [-1,0]/[0,1])
-    p.add_argument("--sim_thr",      type=float, default=0.8)
+    p.add_argument("--sim_thr",      type=float, default=0.75)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
