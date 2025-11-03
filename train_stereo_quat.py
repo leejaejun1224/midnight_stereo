@@ -223,8 +223,9 @@ def unpad_bhwc(x: torch.Tensor, pad_q: Tuple[int, int]) -> torch.Tensor:
         x = x[:, :, :-pad_r, :]
     return x.contiguous()
 
+
 # =========================
-# 학습 루프 (입력 16배수 패딩 → 모델 → 출력 언패드, 모든 손실 @1/4)
+# 학습 루프 (입력 16배수 패딩 → 모델 → 출력 언패드, 모든 손실 @1/4 + Full-res 추가)
 # =========================
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -266,7 +267,12 @@ def train(args):
         local_radius_cells=args.local_radius
     ).to(device).train()
 
-    # --- 손실 (모두 1/4) ---
+    ckpt_model = torch.nn.ModuleDict({
+        "stereo": stereo,
+        "decoder": decoder,
+    })
+
+    # --- 손실 (모두 1/4 + Full-res 추가) ---
     dir_loss_fn = DirectionalRelScaleDispLoss(
         sim_thr=args.sim_thr, sim_gamma=args.sim_gamma,
         sample_k=args.sim_sample_k,
@@ -283,7 +289,6 @@ def train(args):
     reprog_loss_fn = None
     if w_reproj > 0.0:
         try:
-            from losses import FeatureReprojLoss
             reprog_loss_fn = FeatureReprojLoss(charbonnier_eps=1e-3).to(device)
         except Exception as e:
             print(f"[Warn] FeatureReprojLoss unavailable ({e}) → w_reproj=0으로 강등")
@@ -300,7 +305,7 @@ def train(args):
     # --- 체크포인트 재개 ---
     start_epoch = 1
     if args.resume and HAS_CKPT:
-        start_epoch, _, ckpt = resume_from_checkpoint(args, (stereo, decoder), device)
+        start_epoch, _, ckpt = resume_from_checkpoint(args,ckpt_model, device)
         if (ckpt is not None) and ("optim" in ckpt) and (not args.resume_reset_optim):
             try:
                 optim.load_state_dict(ckpt["optim"]); _move_optimizer_state_to_device(optim, device)
@@ -327,7 +332,7 @@ def train(args):
             imgL = imgL.to(device, non_blocking=True)  # ImageNet 정규화 가정
             imgR = imgR.to(device, non_blocking=True)
 
-            # Photometric용 [0,1] 복원 (언패드 기준으로 쓸 예정)
+            # Photometric용 [0,1] 복원 (언패드 원본 크기)
             with torch.no_grad():
                 imgL_01 = denorm_imagenet(imgL)
                 imgR_01 = denorm_imagenet(imgR)
@@ -344,7 +349,7 @@ def train(args):
                 bb_out = stereo(imgL_pad, imgR_pad)
                 pred   = decoder(bb_out)
 
-                # 3) 출력 언패드 — 모두 1/4 해상도 좌표계
+                # 3) 출력 언패드 — 모두 1/4 해상도 좌표계(+Full-res)
                 pad_q = (pad[0] // 4, pad[1] // 4)
 
                 # 예측 disparity 두 버전 유지:
@@ -352,15 +357,22 @@ def train(args):
                 disp_q_qpx_padded = pred["disp_1_4"] / 4.0                 # [B,1,Hq_pad,Wq_pad], unit: 1/4‑px
                 disp_q_qpx        = unpad_last2(disp_q_qpx_padded, pad_q)  # [B,1,Hq,Wq],      unit: 1/4‑px
 
-                # (b) px 단위(EPE/D1용) — 디코더는 full‑px 기준으로 낸다고 가정
+                # (b) px 단위(EPE/D1용)
                 disp_q_px = unpad_last2(pred["disp_1_4"], pad_q)           # [B,1,Hq,Wq],      unit: px
 
                 # (c) feature들 언패드
                 CS_1_4_padded = bb_out["left"]["cossim_feat_1_4"]  # [B,Hq_pad,Wq_pad,C] (BHWC)
                 CS_1_4        = unpad_bhwc(CS_1_4_padded, pad_q)   # [B,Hq,Wq,C]
-
                 feat_L = unpad_last2(bb_out["left"]["fused_1_4"],  pad_q)  # [B,C,Hq,Wq]
                 feat_R = unpad_last2(bb_out["right"]["fused_1_4"], pad_q)  # [B,C,Hq,Wq]
+
+                # (d) full-res disparity(px) — 디코더 제공 or 업샘플 fallback
+                if "disp_full" in pred:
+                    disp_full_px_padded = pred["disp_full"]                # [B,1,H_pad,W_pad]
+                    disp_full_px        = unpad_last2(disp_full_px_padded, pad)  # [B,1,H,W]
+                else:
+                    # fallback: 1/4 지도(px)를 ×4 업샘플
+                    disp_full_px = F.interpolate(disp_q_px, scale_factor=4, mode="bilinear", align_corners=False)
 
                 # --- Losses @ 1/4 ---
                 roi_1_4 = torch.ones_like(disp_q_qpx)
@@ -374,16 +386,32 @@ def train(args):
                 # 우→좌 warp (1/4 격자, 1/4‑px 단위)
                 imgR_qwarp, valid_q = warp_right_to_left_image(imgR_q01, disp_q_qpx)
 
-                # Photometric
+                # Photometric @1/4
                 photo_map_q  = photo_crit.simple_photometric_loss(imgL_q01, imgR_qwarp, weights=[args.photo_l1_w, args.photo_ssim_w])
                 loss_photo_q = (photo_map_q * valid_q).sum() / (valid_q.sum() + 1e-6)
                 loss_photo_q = loss_photo_q * args.w_photo_qres
 
-                # Edge-aware smoothness
+                # Smoothness @1/4
                 loss_smooth_q = get_disparity_smooth_loss(disp_q_qpx, imgL_q01) * args.w_smooth_qres
 
+                # --- 추가: Full-res Photometric & Smoothness ---
+                # 우→좌 warp (원본 해상도, px 단위)
+                imgR_full_warp, valid_full = warp_right_to_left_image(imgR_01, disp_full_px)
+
+                # Photometric @Full-res
+                photo_map_full  = photo_crit.simple_photometric_loss(imgL_01, imgR_full_warp, weights=[args.photo_l1_w, args.photo_ssim_w])
+                loss_photo_full = (photo_map_full * valid_full).sum() / (valid_full.sum() + 1e-6)
+                loss_photo_full = loss_photo_full * args.w_photo_fullres
+
+                # Smoothness @Full-res
+                loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
+
                 # 총손실
-                loss = loss_dir + loss_photo_q + loss_smooth_q + (loss_reproj if isinstance(loss_reproj, torch.Tensor) else torch.tensor(loss_reproj, device=device, dtype=loss_photo_q.dtype))
+                loss = (
+                    loss_dir
+                    + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
+                )
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full
 
             # 최적화
             optim.zero_grad(set_to_none=True)
@@ -413,11 +441,9 @@ def train(args):
                         has_fb = (getattr(args, "focal_px", 0.0) > 0.0) and (getattr(args, "baseline_m", 0.0) > 0.0)
                         if has_fb:
                             # --- Disparity metrics (px 기준) ---
-                            # GT disparity(px) — full‑px 단위 유지 (임계값 정의와 일치)
-                            gt_disp_q_px = (args.focal_px * args.baseline_m) / gt_depth_q.clamp_min(1e-6) / 4.0
-                            # 예측(px) — 디코더 출력 언패드
-                            pred_disp_q_px = disp_q_px / 4.0
-                            disp_metrics = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid_mask)
+                            gt_disp_q_px   = (args.focal_px * args.baseline_m) / gt_depth_q.clamp_min(1e-6)  # px
+                            pred_disp_q_px = disp_q_px                                                             # px
+                            disp_metrics   = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid_mask)
 
                             # --- Depth metrics (@1/4 격자) ---
                             fx_q = args.focal_px / 4.0
@@ -440,7 +466,7 @@ def train(args):
 
                             extra_eval = (
                                 f" || [Disp(px)] EPE={_get(disp_metrics,'EPE')}  D1={_get(disp_metrics,'D1_all','{:.2f}')}%  "
-                                f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2px','{:.2f}')}%  "
+                                f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2 px','{:.2f}')}%  "
                                 f"[Depth@1/4] AbsRel={_get(depth_metrics,'AbsRel')}  RMSE={_get(depth_metrics,'RMSE')}  "
                                 f"δ1={_get(depth_metrics,'δ<1.25')}"
                             )
@@ -452,7 +478,9 @@ def train(args):
                 lrp = (loss_reproj.item() if isinstance(loss_reproj, torch.Tensor) else float(loss_reproj)) if (w_reproj > 0) else 0.0
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
-                      f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f})"
+                      f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
+                      f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
+                      f"photoF={float(loss_photo_full):.4f}, smoothF={float(loss_smooth_full):.4f})"
                       f"{extra_eval}")
                 running = 0.0
 
@@ -469,7 +497,7 @@ def train(args):
             if HAS_CKPT:
                 save_checkpoint(
                     ckpt_path, epoch,
-                    (stereo, decoder), optim, scaler, args
+                    ckpt_model, optim, scaler, args
                 )
             else:
                 torch.save({
@@ -487,7 +515,7 @@ def train(args):
 # argparse
 # =========================
 def get_args():
-    p = argparse.ArgumentParser("Stereo — All losses @1/4 (inputs padded to ×16, outputs unpadded)")
+    p = argparse.ArgumentParser("Stereo — All losses @1/4 + Full-res photometric/smooth (inputs padded to ×16, outputs unpadded)")
 
     # 데이터
     p.add_argument("--left_dir",  type=str, required=True)
@@ -513,13 +541,18 @@ def get_args():
     p.add_argument("--amp",        type=bool, default=True)
     p.add_argument("--seed",       type=int, default=42)
 
-    # 손실 가중치 (모두 1/4)
-    p.add_argument("--w_dir",            type=float, default=1.0)
-    p.add_argument("--w_photo_qres",     type=float, default=1.0,  help="Photometric @1/4")
-    p.add_argument("--w_smooth_qres",    type=float, default=0.01, help="Smoothness  @1/4")
-    p.add_argument("--w_reproj",     type=float, default=1.0)
-    p.add_argument("--photo_l1_w",       type=float, default=0.15)
-    p.add_argument("--photo_ssim_w",     type=float, default=0.85)
+    # 손실 가중치
+    p.add_argument("--w_dir",              type=float, default=1.0)
+    p.add_argument("--w_reproj",           type=float, default=1.0)
+    # 1/4 해상도
+    p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
+    p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
+    # Full-res 추가
+    p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.01, help="Smoothness  @Full-res")
+    # photometric 내부 가중(공통)
+    p.add_argument("--photo_l1_w",         type=float, default=0.15)
+    p.add_argument("--photo_ssim_w",       type=float, default=0.85)
 
     # DirectionalRelScaleDispLoss 하이퍼 (cossim + 세로 [-1,0]/[0,1])
     p.add_argument("--sim_thr",      type=float, default=0.75)
