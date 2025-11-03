@@ -2,35 +2,55 @@
 # -*- coding: utf-8 -*-
 
 """
-find_sky_patch_dino_s8.py
-- DINO v1 ViT-S/8 패치 특징으로 시퀀스 상단 절반(하늘 후보)에서
-  프레임 간 feature distance 하위 5% 패치를 골라 EMA 프로토타입을 만들고,
-  첫 프레임에서 가장 유사한 패치 위치를 찾습니다.
+make_change_heatmaps_dino_s8_accum_ema.py
+
+기능 요약
+- DINO ViT-S/8 패치 특징으로 프레임별 "변화량" 히트맵을 생성
+- 로컬 모션 보상(±r 셀 탐색)으로 min-Δ 거리 사용
+- 즉시 변화량(instantaneous) 히트맵 저장 (옵션)
+- 전 과거 누적(무한 누적) EMA 히트맵 저장 (옵션)
+  M_t = α M_{t-1} + (1-α) D_t
+  * D_t는 (a) 현재 vs 직전, 또는 (b) 현재 vs 과거 K개 집계(mean/median/max/min)
+
+사용 예시
+python make_change_heatmaps_dino_s8_accum_ema.py \
+  --image_dir /path/to/frames \
+  --out_dir ./heatmaps \
+  --search_radius 1 \
+  --accum_ema 1 --accum_alpha 0.95 --accum_source prev \
+  --history 6 --agg mean \
+  --save_inst 1 --save_ema 1 --save_overlay 1 --alpha 0.6 --cmap magma
 """
 
 import os
 import re
-import math
 import argparse
-from typing import List, Tuple
+from collections import deque
+from typing import List, Tuple, Deque, Dict, Any
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
+# headless 저장
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib import cm
+import numpy as np
+
 # -----------------------------
 # 유틸
 # -----------------------------
 def natural_key(s: str):
-    # 문자열 내 숫자를 정수로 변환해 자연 정렬
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 def list_images(image_dir: str, exts: Tuple[str, ...] = ('.jpg', '.jpeg', '.png', '.bmp')):
     files = [os.path.join(image_dir, f) for f in os.listdir(image_dir)
              if os.path.splitext(f.lower())[1] in exts]
-    files.sort(key=natural_key)
+    files.sort(key=natural_key)  # ✅ 핵심 수정: key=natural_key
     return files
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -46,9 +66,6 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-8) -> torch.Ten
 # DINO v1 ViT-S/8 로더 & 특징 추출
 # -----------------------------
 def load_dino_vits8(device: torch.device):
-    """
-    facebookresearch/dino:main 의 dino_vits8 모델을 torch.hub로 로드.
-    """
     model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
     model.eval()
     model.to(device)
@@ -57,22 +74,18 @@ def load_dino_vits8(device: torch.device):
 @torch.no_grad()
 def extract_dino_patch_tokens(model, img_t: torch.Tensor, patch_size: int = 8) -> torch.Tensor:
     """
-    모델에서 마지막 레이어의 패치 토큰을 추출하여 (H_p, W_p, C)로 반환.
-    - img_t: (1, 3, Hpad, Wpad) [0-1] 정규화 후 ImageNet 정규화된 텐서
-    - 반환: feats_hw: (H_p, W_p, C) L2 정규화 전(여기서 정규화는 호출부에서 수행)
+    - img_t: (1,3,Hpad,Wpad) ImageNet 정규화 텐서
+    - 반환: (Hp, Wp, C)  (CLS 제외, 마지막 레이어)
     """
-    # facebook DINO 모델은 get_intermediate_layers 제공
     feats = model.get_intermediate_layers(img_t, n=1)[0]  # (1, N+1, C)
-    feats = feats[:, 1:, :]  # CLS 제거 -> (1, N, C)
-
+    feats = feats[:, 1:, :]  # remove CLS
     B, N, C = feats.shape
     _, _, Hpad, Wpad = img_t.shape
     H_p = Hpad // patch_size
     W_p = Wpad // patch_size
-    assert N == H_p * W_p, f"Token 수 N={N} != H_p*W_p={H_p*W_p}. 입력 크기/패치 크기를 확인하세요."
-
+    assert N == H_p * W_p, f"N={N} != H_p*W_p={H_p*W_p}"
     feats = feats.reshape(B, H_p, W_p, C)
-    return feats[0]  # (H_p, W_p, C)
+    return feats[0]
 
 # -----------------------------
 # 전처리: 패딩/정규화
@@ -82,14 +95,14 @@ IMNET_STD  = [0.229, 0.224, 0.225]
 
 def load_and_prepare(path: str, device: torch.device, pad_to_multiple: int = 8):
     """
-    이미지를 로드하여 오른쪽/아래로 8의 배수가 되도록 0 패딩하고,
-    ToTensor + ImageNet 정규화를 적용해 (1,3,Hpad,Wpad) 텐서와
-    원본 크기(H,W)를 함께 반환.
+    반환:
+      x_imnet : (1,3,Hpad,Wpad) ImageNet 정규화 텐서
+      (H,W)   : 원본 크기
+      (Hpad,Wpad) : 패딩 후 크기
     """
     img = Image.open(path).convert('RGB')
     W, H = img.size
 
-    # pad right/bottom to multiple of 8
     pad_r = (pad_to_multiple - (W % pad_to_multiple)) % pad_to_multiple
     pad_b = (pad_to_multiple - (H % pad_to_multiple)) % pad_to_multiple
 
@@ -99,182 +112,290 @@ def load_and_prepare(path: str, device: torch.device, pad_to_multiple: int = 8):
     ])
     x = transform(img)  # (3,H,W)
     if pad_r != 0 or pad_b != 0:
-        # pad format: (left, right, top, bottom)
         x = F.pad(x, (0, pad_r, 0, pad_b), value=0.0)
+
     x = x.unsqueeze(0).to(device)  # (1,3,Hpad,Wpad)
     Hpad, Wpad = x.shape[-2], x.shape[-1]
     return x, (H, W), (Hpad, Wpad)
 
-def build_top_half_valid_mask(H: int, W: int, Hpad: int, Wpad: int, patch: int = 8, device=None):
+# -----------------------------
+# Local motion-compensated distance (±r 탐색)
+# -----------------------------
+def min_dist_with_local_search(feats_a: torch.Tensor,
+                               feats_b: torch.Tensor,
+                               r: int = 1):
     """
-    원본 H,W와 패딩된 Hpad,Wpad가 주어졌을 때,
-    패치 그리드(H_p, W_p) 상에서 '원본 영역 안'이면서 '상단 절반(하늘 후보)'인 위치 마스크를 생성.
-    - 유효 기준: 패치 중심 (y= row*patch + patch/2, x= col*patch + patch/2)
-                 가 각각 y < H, x < W (원본 내부) 이고, y < H/2 (상단 절반)
-    반환: mask: (H_p, W_p) bool
+    feats_*: (Hp, Wp, C) [L2 정규화 완료]
+    r: 패치 그리드에서 탐색 반경(0이면 동일 위치 비교)
+    반환: dist_map (Hp, Wp), 최소 거리
     """
-    H_p = Hpad // patch
-    W_p = Wpad // patch
-    ys = torch.arange(H_p, device=device) * patch + patch // 2  # 패치 중심 y
-    xs = torch.arange(W_p, device=device) * patch + patch // 2  # 패치 중심 x
-    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-    inside = (yy < H) & (xx < W)
-    top_half = yy < (H // 2)
-    return (inside & top_half)
+    Hp, Wp, C = feats_a.shape
+    device = feats_a.device
+
+    if r <= 0:
+        sim = (feats_a * feats_b).sum(dim=-1)         # (Hp, Wp)
+        return 1.0 - sim
+
+    best = torch.full((Hp, Wp), 2.0, device=device)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            y0, y1 = max(0,  dy), min(Hp, Hp + dy)
+            x0, x1 = max(0,  dx), min(Wp, Wp + dx)
+            yy0, yy1 = max(0, -dy), min(Hp, Hp - dy)
+            xx0, xx1 = max(0, -dx), min(Wp, Wp - dx)
+            if y0 >= y1 or x0 >= x1:
+                continue
+            sim = (feats_a[yy0:yy1, xx0:xx1] * feats_b[y0:y1, x0:x1]).sum(dim=-1)
+            dist = 1.0 - sim
+            sub = best[yy0:yy1, xx0:xx1]
+            best[yy0:yy1, xx0:xx1] = torch.minimum(sub, dist)
+    return best
 
 # -----------------------------
-# 메인 로직
+# 히트맵 유틸
+# -----------------------------
+def normalize_per_frame(x: torch.Tensor, vmin_q: float = 0.02, vmax_q: float = 0.98) -> torch.Tensor:
+    """
+    x: (Hp, Wp) 거리 맵 -> 0..1
+    분위수로 범위를 잡아 outlier 영향 축소
+    """
+    flat = x.flatten()
+    vmin = torch.quantile(flat, vmin_q)
+    vmax = torch.quantile(flat, vmax_q)
+    if float(vmax - vmin) < 1e-6:
+        return torch.zeros_like(x)
+    return ((x - vmin) / (vmax - vmin)).clamp_(0.0, 1.0)
+
+def tensor_to_colormap_img(x01: torch.Tensor, cmap_name: str = "magma") -> Image.Image:
+    """
+    x01: (H, W) 0..1 텐서 -> RGB heatmap PIL Image
+    """
+    arr = x01.detach().cpu().numpy()
+    rgba = cm.get_cmap(cmap_name)(arr)  # (H,W,4), 0..1
+    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+    return Image.fromarray(rgb)
+
+def overlay_on_image(base_img: Image.Image, heat_img: Image.Image, alpha: float = 0.6) -> Image.Image:
+    base = np.array(base_img).astype(np.float32)
+    heat = np.array(heat_img).astype(np.float32)
+    over = (alpha * heat + (1 - alpha) * base).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(over)
+
+# -----------------------------
+# 메인
 # -----------------------------
 @torch.no_grad()
-def run(image_dir: str, ema_decay: float = 0.9, low_pct: float = 5.0, patch_size: int = 8):
+def run(image_dir: str,
+        out_dir: str,
+        patch_size: int = 8,
+        search_radius: int = 1,
+        # D_t 구성 방식
+        accum_source: str = "prev",     # 'prev' or 'hist_mean'
+        history: int = 6,               # accum_source='hist_mean'일 때 과거 창 크기
+        agg: str = "mean",              # mean/median/max/min for hist_mean
+        # 저장 옵션
+        save_inst: bool = True,
+        save_ema: bool = True,
+        save_overlay: bool = True,
+        alpha: float = 0.6,
+        cmap_name: str = "magma",
+        vmin_q: float = 0.02,
+        vmax_q: float = 0.98,
+        # 시간 EMA
+        accum_ema: bool = True,
+        accum_alpha: float = 0.95):
+
     device = get_device()
     print(f"[Info] Device: {device}")
 
-    # 1) 이미지 목록
     img_paths = list_images(image_dir)
     if len(img_paths) < 2:
-        raise ValueError("시퀀스가 2장 미만입니다. 최소 2장 이상의 연속 프레임이 필요합니다.")
+        raise ValueError("시퀀스가 2장 미만입니다.")
     print(f"[Info] Found {len(img_paths)} frames")
 
-    # 2) DINO v1 ViT-S/8 로드
+    # 출력 폴더 구성
+    inst_dir = os.path.join(out_dir, "inst_heat")
+    inst_ov_dir = os.path.join(out_dir, "inst_overlay")
+    ema_dir = os.path.join(out_dir, "ema_heat")
+    ema_ov_dir = os.path.join(out_dir, "ema_overlay")
+    os.makedirs(out_dir, exist_ok=True)
+    if save_inst:
+        os.makedirs(inst_dir, exist_ok=True)
+        if save_overlay:
+            os.makedirs(inst_ov_dir, exist_ok=True)
+    if accum_ema and save_ema:
+        os.makedirs(ema_dir, exist_ok=True)
+        if save_overlay:
+            os.makedirs(ema_ov_dir, exist_ok=True)
+
     print("[Info] Loading DINO v1 ViT-S/8 (torch.hub: facebookresearch/dino:main, dino_vits8)")
     model = load_dino_vits8(device)
 
-    # 3) 첫 프레임 특징 미리 계산 (슬라이딩 윈도우용)
-    x0, (H0, W0), (H0pad, W0pad) = load_and_prepare(img_paths[0], device, pad_to_multiple=patch_size)
-    feats_prev = extract_dino_patch_tokens(model, x0, patch_size)  # (H_p, W_p, C)
-    feats_prev = l2_normalize(feats_prev, dim=-1)
+    # 과거 특징 버퍼 (CPU half로 저장)
+    past_buf: Deque[Dict[str, Any]] = deque(maxlen=max(1, history))
+    prev_item: Dict[str, Any] = {}  # 직전 프레임 저장
 
-    # 첫 프레임의 상단 절반 유효 마스크 (최종 위치 검색에 재사용)
-    top_mask_first = build_top_half_valid_mask(H0, W0, H0pad, W0pad, patch=patch_size, device=device)
+    def feats_to_cpu_half(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().to("cpu", dtype=torch.float16).contiguous()
 
-    ema_vec = None
-    Cdim = feats_prev.shape[-1]
+    def cpu_half_to_device_fp32(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device=device, dtype=torch.float32, non_blocking=True)
 
-    # 4) 시퀀스 순회: (t, t+1) 쌍으로 진행
-    for idx in range(len(img_paths) - 1):
-        p_t   = img_paths[idx]
-        p_t1  = img_paths[idx + 1]
-
-        # 현재 쌍 로드/특징
-        if idx == 0:
-            feats_t = feats_prev  # 이미 계산
-            Hpad_t, Wpad_t = x0.shape[-2], x0.shape[-1]
-            H_t, W_t = H0, W0
+    def reduce_stack(stack: torch.Tensor, how: str) -> torch.Tensor:
+        if how == "mean":
+            return stack.mean(dim=0)
+        elif how == "median":
+            return stack.median(dim=0).values
+        elif how == "max":
+            return stack.max(dim=0).values
+        elif how == "min":
+            return stack.min(dim=0).values
         else:
-            xt, (H_t, W_t), (Hpad_t, Wpad_t) = load_and_prepare(p_t, device, pad_to_multiple=patch_size)
-            feats_t = extract_dino_patch_tokens(model, xt, patch_size)
-            feats_t = l2_normalize(feats_t, dim=-1)
+            raise ValueError(f"Unknown agg: {how}")
 
-        xt1, (H_t1, W_t1), (Hpad_t1, Wpad_t1) = load_and_prepare(p_t1, device, pad_to_multiple=patch_size)
-        feats_t1 = extract_dino_patch_tokens(model, xt1, patch_size)
-        feats_t1 = l2_normalize(feats_t1, dim=-1)
+    ema_map = None  # (Hp, Wp) on device
 
-        # 안전성: 패치 그리드 크기가 달라지면(이상 케이스) 현재 쌍을 스킵
-        if feats_t.shape != feats_t1.shape:
-            print(f"[Warn] Patch grid mismatch at {os.path.basename(p_t)} -> {os.path.basename(p_t1)}. Skip pair.")
-            feats_prev = feats_t1
-            continue
+    for idx, p in enumerate(img_paths):
+        base = os.path.basename(p)
 
+        # 1) 특징 추출
+        x_t, (H, W), (Hpad, Wpad) = load_and_prepare(p, device, pad_to_multiple=patch_size)
+        feats_t = extract_dino_patch_tokens(model, x_t, patch_size)
+        feats_t = l2_normalize(feats_t, dim=-1)   # (Hp, Wp, C)
         Hp, Wp, C = feats_t.shape
-        assert C == Cdim, "특징 차원이 일관되지 않습니다."
 
-        # 상단 절반 유효 마스크 (현재 프레임 기준)
-        top_mask = build_top_half_valid_mask(H_t, W_t, Hpad_t, Wpad_t, patch=patch_size, device=device)
-        # 유효 영역 이외는 선택에서 제외하기 위해 mask 이용
-        valid_idx = top_mask.view(-1).nonzero(as_tuple=False).squeeze(1)
-        if valid_idx.numel() == 0:
-            print(f"[Warn] No valid top-half tokens at frame {idx}. Skip EMA update.")
-            feats_prev = feats_t1
-            continue
+        # 2) D_t (instantaneous change map) 계산
+        have_D = False
+        D_map = None
 
-        # 5) 동일 위치 cosine distance
-        # sim(i,j) = dot(f_t, f_t1)  -> dist = 1 - sim
-        sim_map = (feats_t * feats_t1).sum(dim=-1)  # (Hp, Wp)
-        dist_map = 1.0 - sim_map  # (Hp, Wp)
+        if accum_source == "prev":
+            if prev_item:
+                pi = prev_item
+                if (pi["Hp"] == Hp and pi["Wp"] == Wp and pi["Hpad"] == Hpad and pi["Wpad"] == Wpad):
+                    feats_prev = cpu_half_to_device_fp32(pi["feats"])
+                    D_map = min_dist_with_local_search(feats_prev, feats_t, r=search_radius)  # (Hp,Wp)
+                    have_D = True
+                else:
+                    print(f"[Warn] {base}: grid mismatch vs previous. Skipped D_t (prev).")
+            else:
+                print(f"[Info] {base}: no previous frame yet. Skipped D_t (prev).")
 
-        # 상단 절반 유효 영역만 펼쳐서 하위 5% 선택
-        dist_vec_valid = dist_map.view(-1)[valid_idx]  # (M,)
-        M = dist_vec_valid.numel()
-        K = max(1, math.ceil(M * (low_pct / 100.0)))
-
-        # 거리 작은 K개 인덱스 (ascending)
-        vals, topk_idx_local = torch.topk(dist_vec_valid, k=K, largest=False)
-        chosen_flat_idx = valid_idx[topk_idx_local]  # 원래 플랫 인덱스
-
-        # 관측 벡터: t+1 프레임의 선택 패치 평균
-        feats_t1_flat = feats_t1.view(-1, C)
-        obs = feats_t1_flat.index_select(0, chosen_flat_idx)  # (K, C)
-        obs = obs.mean(dim=0)  # (C,)
-        obs = l2_normalize(obs, dim=0)
-
-        # 6) EMA 업데이트
-        if ema_vec is None:
-            ema_vec = obs.clone()
+        elif accum_source == "hist_mean":
+            dist_maps: List[torch.Tensor] = []
+            valid_past = 0
+            for item in past_buf:
+                if item["Hp"] != Hp or item["Wp"] != Wp or item["Hpad"] != Hpad or item["Wpad"] != Wpad:
+                    continue
+                feats_past = cpu_half_to_device_fp32(item["feats"])
+                dist = min_dist_with_local_search(feats_past, feats_t, r=search_radius)
+                dist_maps.append(dist)
+                valid_past += 1
+            if valid_past > 0:
+                stack = torch.stack(dist_maps, dim=0)  # (K,Hp,Wp)
+                D_map = reduce_stack(stack, agg)       # (Hp,Wp)
+                have_D = True
+            else:
+                print(f"[Info] {base}: no valid past window. Skipped D_t (hist_mean).")
         else:
-            ema_vec = ema_decay * ema_vec + (1.0 - ema_decay) * obs
-            ema_vec = l2_normalize(ema_vec, dim=0)
+            raise ValueError("--accum_source must be 'prev' or 'hist_mean'")
 
-        feats_prev = feats_t1  # 슬라이딩 윈도우 갱신
+        # 3) 즉시 변화량 저장(옵션)
+        if have_D and save_inst:
+            D01 = normalize_per_frame(D_map, vmin_q=vmin_q, vmax_q=vmax_q)
+            D01_up = F.interpolate(D01[None, None].float(), size=(Hpad, Wpad),
+                                   mode='bilinear', align_corners=False)[0, 0]
+            D01_up = D01_up[:H, :W]
+            heat_img = tensor_to_colormap_img(D01_up, cmap_name=cmap_name)
+            heat_path = os.path.join(inst_dir, base)
+            heat_img.save(heat_path)
+            if save_overlay:
+                orig_img = Image.open(p).convert("RGB")
+                ov = overlay_on_image(orig_img, heat_img, alpha=alpha)
+                ov_path = os.path.join(inst_ov_dir, base)
+                ov.save(ov_path)
+            print(f"[Save][inst] {base}")
 
-        if (idx + 1) % 10 == 0 or (idx + 1) == (len(img_paths) - 1):
-            print(f"[Info] Processed pair {idx}->{idx+1}, EMA updated. K={K}, mean dist={float(vals.mean()):.4f}")
+        # 4) 시간 EMA 누적(옵션)
+        if accum_ema and have_D:
+            if (ema_map is None) or (ema_map.shape[0] != Hp or ema_map.shape[1] != Wp):
+                ema_map = torch.zeros((Hp, Wp), device=device)
+                print(f"[Info] EMA map initialized @ {Hp}x{Wp}")
+            ema_map = accum_alpha * ema_map + (1.0 - accum_alpha) * D_map  # on device
 
-    if ema_vec is None:
-        raise RuntimeError("EMA가 생성되지 않았습니다. 유효한 프레임 쌍이 없었을 수 있습니다.")
+            if save_ema:
+                E01 = normalize_per_frame(ema_map, vmin_q=vmin_q, vmax_q=vmax_q)
+                E01_up = F.interpolate(E01[None, None].float(), size=(Hpad, Wpad),
+                                       mode='bilinear', align_corners=False)[0, 0]
+                E01_up = E01_up[:H, :W]
+                ema_img = tensor_to_colormap_img(E01_up, cmap_name=cmap_name)
+                ema_path = os.path.join(ema_dir, base)
+                ema_img.save(ema_path)
+                if save_overlay:
+                    orig_img = Image.open(p).convert("RGB")
+                    ov = overlay_on_image(orig_img, ema_img, alpha=alpha)
+                    ov_path = os.path.join(ema_ov_dir, base)
+                    ov.save(ov_path)
+                print(f"[Save][ema]  {base}")
 
-    # 7) 첫 프레임에서 ema와 최유사 패치 위치 검색 (상단 절반 권장)
-    # 첫 프레임 특징은 feats_prev가 아님에 주의. 다시 계산/사용.
-    feats_first = extract_dino_patch_tokens(model, x0, patch_size)
-    feats_first = l2_normalize(feats_first, dim=-1)  # (Hp0, Wp0, C)
-    Hp0, Wp0, _ = feats_first.shape
+        # 5) 버퍼 갱신 (마지막에)
+        item = {
+            "feats": feats_t.detach().to("cpu", dtype=torch.float16).contiguous(),
+            "Hp": Hp, "Wp": Wp, "Hpad": Hpad, "Wpad": Wpad,
+        }
+        prev_item = item  # 직전 프레임
+        if accum_source == "hist_mean":
+            past_buf.append(item)
 
-    ema_vec_ = ema_vec.view(1, 1, -1)  # (1,1,C)
-    sim0 = (feats_first * ema_vec_).sum(dim=-1)  # (Hp0, Wp0), cosine similarity
-    # 상단 절반만 고려 (명시적 요구는 선택 단계였지만, 하늘 위치를 찾는 목적이므로 동일 제약 적용 권장)
-    sim0_masked = sim0.clone()
-    sim0_masked[~top_mask_first] = -1e9  # 배제
-
-    best_idx = torch.argmax(sim0_masked.view(-1)).item()
-    best_r = best_idx // Wp0
-    best_c = best_idx % Wp0
-
-    # 패치 중심 기준 원본 좌표 (패딩 전)
-    best_x = int(best_c * patch_size + patch_size // 2)
-    best_y = int(best_r * patch_size + patch_size // 2)
-    best_x = min(best_x, W0 - 1)
-    best_y = min(best_y, H0 - 1)
-
-    print("\n========== RESULT ==========")
-    print(f"Best patch (row, col) on first frame: ({best_r}, {best_c})  [grid {Hp0}x{Wp0}]")
-    print(f"Pixel coordinate (approx. patch center): (x={best_x}, y={best_y}) within original size (W={W0}, H={H0})")
-    print(f"Cosine similarity at best location: {float(sim0[best_r, best_c]):.6f}")
-    print("============================\n")
-
-    return {
-        "grid_rc": (best_r, best_c),
-        "pixel_xy": (best_x, best_y),
-        "similarity": float(sim0[best_r, best_c]),
-        "grid_size": (Hp0, Wp0),
-        "first_image": img_paths[0],
-    }
+    print("\n[Done] Outputs in:", os.path.abspath(out_dir))
 
 # -----------------------------
 # CLI
 # -----------------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="Find sky-like stable patch with DINO v1 ViT-S/8 over a sequence.")
-    ap.add_argument("--image_dir", type=str,default='/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_left', help="입력 시퀀스 이미지 폴더 경로")
-    ap.add_argument("--ema_decay", type=float, default=0.9, help="EMA decay (0~1, 클수록 과거 가중↑)")
-    ap.add_argument("--low_pct", type=float, default=5.0, help="프레임 쌍 distance 하위 백분율(%)")
-    ap.add_argument("--patch_size", type=int, default=8, help="DINO 패치 크기(여기서는 8)")
+    ap = argparse.ArgumentParser(description="DINO ViT-S/8 change heatmaps with infinite-time EMA accumulation.")
+    ap.add_argument("--image_dir", type=str, default='/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_left', help="입력 시퀀스 이미지 폴더")
+    ap.add_argument("--out_dir", type=str, default="../log/heatmap_out", help="출력 폴더(하위에 inst/ema 등 생성)")
+
+    ap.add_argument("--patch_size", type=int, default=8, help="DINO 패치 크기(8)")
+    ap.add_argument("--search_radius", type=int, default=1, help="로컬 모션 보상 탐색 반경 r (0이면 동일 위치 비교)")
+
+    ap.add_argument("--accum_source", type=str, default="hist_mean", choices=["prev", "hist_mean"],
+                    help="D_t 구성 방식: prev=현재vs직전, hist_mean=현재vs과거K 집계")
+    ap.add_argument("--history", type=int, default=6, help="accum_source=hist_mean일 때 과거 창 크기")
+    ap.add_argument("--agg", type=str, default="mean", choices=["mean", "median", "max", "min"],
+                    help="hist_mean의 거리 집계 방식")
+
+    ap.add_argument("--accum_ema", type=int, default=1, help="시간 EMA 누적 저장 여부(1/0)")
+    ap.add_argument("--accum_alpha", type=float, default=0.95, help="EMA α (0~1, 클수록 과거 가중↑)")
+
+    ap.add_argument("--save_inst", type=int, default=1, help="즉시 변화량 히트맵 저장(1/0)")
+    ap.add_argument("--save_ema", type=int, default=1, help="EMA 누적 히트맵 저장(1/0)")
+    ap.add_argument("--save_overlay", type=int, default=1, help="원본 위 오버레이 저장(1/0)")
+    ap.add_argument("--alpha", type=float, default=0.6, help="오버레이 알파")
+    ap.add_argument("--cmap", type=str, default="magma",
+                    help="matplotlib 컬러맵 이름(예: magma, viridis, turbo, jet)")
+    ap.add_argument("--vmin_q", type=float, default=0.02, help="정규화 하위 분위수")
+    ap.add_argument("--vmax_q", type=float, default=0.98, help="정규화 상위 분위수")
     return ap.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
+    torch.set_grad_enabled(False)
     _ = run(
         image_dir=args.image_dir,
-        ema_decay=args.ema_decay,
-        low_pct=args.low_pct,
+        out_dir=args.out_dir,
         patch_size=args.patch_size,
+        search_radius=max(0, args.search_radius),
+        accum_source=args.accum_source,
+        history=max(1, args.history),
+        agg=args.agg,
+        save_inst=bool(args.save_inst),
+        save_ema=bool(args.save_ema),
+        save_overlay=bool(args.save_overlay),
+        alpha=args.alpha,
+        cmap_name=args.cmap,
+        vmin_q=args.vmin_q,
+        vmax_q=args.vmax_q,
+        accum_ema=bool(args.accum_ema),
+        accum_alpha=args.accum_alpha,
     )
