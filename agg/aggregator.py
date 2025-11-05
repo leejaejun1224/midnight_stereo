@@ -173,41 +173,109 @@ class Hourglass3D(nn.Module):
         self.down1 = Basic3D(c, c, s=2)
         self.down2 = Basic3D(c, c*2, s=2)
         self.mid   = Basic3D(c*2, c*2)
-        self.up1   = nn.ConvTranspose3d(c*2, c, 3, 2, 1, 1)
-        self.up2   = nn.ConvTranspose3d(c, c, 3, 2, 1, 1)
+        # ✔ output_padding을 고정값(=1)으로 박지 않습니다.
+        self.up1   = nn.ConvTranspose3d(c*2, c, 3, 2, 1)  # output_padding 생략
+        self.up2   = nn.ConvTranspose3d(c, c, 3, 2, 1)    # output_padding 생략
         self.post  = Basic3D(c, c)
         self.out   = nn.Conv3d(c, 1, 3, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.in_block(x)
-        x1 = self.down1(x0)
-        x2 = self.down2(x1)
-        xm = self.mid(x2)
-        y  = self.up1(xm) + x1
-        y  = self.up2(y)  + x0
+        x0 = self.in_block(x)  # [B,c, D0,H0,W0]
+        x1 = self.down1(x0)    # [B,c, D1,H1,W1]
+        x2 = self.down2(x1)    # [B,2c,D2,H2,W2]
+        xm = self.mid(x2)      # [B,2c,D2,H2,W2]
+
+        # ✔ 업샘플 때 목표 사이즈를 명시해서 스킵과 정확히 일치시킵니다.
+        y  = self.up1(xm, output_size=x1.shape[-3:]) + x1
+        y  = self.up2(y,  output_size=x0.shape[-3:]) + x0
+
         y  = self.post(y)
-        return self.out(y).squeeze(1)  # [B,D,H,W]
+        return self.out(y).squeeze(1)  # [B,D0,H0,W0]
 
 
-# ---------------------------
-# 6) Full-res refine (x4 upsample + light 2D)
-# ---------------------------
-class FullRefine(nn.Module):
-    def __init__(self, cf: int = 256, mid: int = 64):
+
+class ConvexUpsampleX4(nn.Module):
+    """
+    RAFT/RAFT-Stereo 스타일 convex upsampler (×4).
+    한 픽셀을 주변 3x3 저해상도 disparity의 '볼록 조합'으로 예측.
+    - disp_q   : [B,1,h,w]
+    - fused_q  : [B,Cf,h,w]  (마스크 예측용 컨텍스트)
+    - 반환 disp : [B,1,4h,4w]
+    """
+    def __init__(self, cf: int = 256, k: int = 3, scale: int = 4, mid: int = 128):
         super().__init__()
-        self.refine = nn.Sequential(
+        assert k == 3, "보통 3x3 패치를 씁니다(논문 관행)."
+        self.k = k
+        self.s = scale
+        kk = k * k
+        ss = scale * scale
+        # 간단한 2층 CNN으로 (s*s*9) 마스크 생성
+        self.mask_pred = nn.Sequential(
+            nn.Conv2d(cf,       mid, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid, ss * kk, 1, 1, 0)
+        )
+
+        # (선택) 잔차 보정용 아주 얕은 헤드: convex 결과 + residual
+        self.residual_head = nn.Sequential(
             nn.Conv2d(1 + cf, mid, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(mid, mid, 3, 1, 1), nn.ReLU(inplace=True),
             nn.Conv2d(mid, 1, 3, 1, 1)
         )
 
-    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
-        H, W = out_hw
-        disp_up  = F.interpolate(disp_q, size=(H, W), mode="bilinear", align_corners=False)
-        fused_up = F.interpolate(fused_q, size=(H, W), mode="bilinear", align_corners=False)
-        return disp_up + self.refine(torch.cat([disp_up, fused_up], dim=1))
+        # 초기화를 살짝 안정적으로: softmax 전 logits ~0 → 거의 uniform
+        for m in self.mask_pred.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                nn.init.zeros_(m.bias)
+        for m in self.residual_head.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
 
+    @torch.no_grad()
+    def _check_shapes(self, disp_q, fused_q):
+        B, _, h, w = disp_q.shape
+        B2, Cf, h2, w2 = fused_q.shape
+        assert B == B2 and h == h2 and w == w2, f"shape mismatch: disp {disp_q.shape}, fused {fused_q.shape}"
 
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor) -> torch.Tensor:
+        """
+        반환: 원본 해상도 disparity [B,1,4h,4w]
+        """
+        self._check_shapes(disp_q, fused_q)
+        B, _, h, w = disp_q.shape
+        k, s = self.k, self.s
+        kk, ss = k * k, s * s
+
+        # 1) 마스크 예측: [B, ss*kk, h, w] → [B, ss, kk, h, w] → softmax(kk축)
+        mask_logits = self.mask_pred(fused_q)                     # [B, ss*kk, h, w]
+        mask = mask_logits.view(B, ss, kk, h, w)
+        mask = F.softmax(mask, dim=2)
+
+        # 2) 3x3 패치 펼치기: [B,1,h,w] → unfold(3x3) → [B, kk, h*w] → [B, 1, kk, h, w]
+        disp_unf = F.unfold(disp_q, kernel_size=k, padding=k//2)  # [B, kk, h*w]
+        disp_unf = disp_unf.view(B, 1, kk, h, w)
+
+        # 3) 볼록 결합: 각 서브픽셀(ss개)에 대해 3x3 가중합 → [B, ss, h, w]
+        up = (mask * disp_unf).sum(dim=2)                         # [B, ss, h, w]
+
+        # 4) PixelShuffle로 4배 업샘플: [B, ss, h, w] → [B, 1, 4h, 4w]
+        disp_full = F.pixel_shuffle(up, upscale_factor=s)         # [B,1,4h,4w]
+
+        # 5) (선택) 잔차 보정: convex 결과 + 아주 얕은 residual (ACV/RAFT류도 종종 씀)
+        fused_up = F.interpolate(fused_q, size=(h * s, w * s), mode="bilinear", align_corners=False)
+        disp_full = disp_full + self.residual_head(torch.cat([disp_full, fused_up], dim=1))
+
+        return disp_full
+    
+class FullRefine(nn.Module):
+    def __init__(self, cf: int = 256, mid: int = 64):
+        super().__init__()
+        # 내부 구현을 convex 업샘플로 바꾼다
+        self.up = ConvexUpsampleX4(cf=cf, mid=128)  # mid는 마스크/잔차 헤드의 내부 채널
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor, out_hw: Optional[tuple] = None) -> torch.Tensor:
+        # out_hw는 더 이상 필요 없음(정확히 ×4 스케일이 보장됨)
+        return self.up(disp_q, fused_q)
 # ---------------------------
 # 7) SOTA-inspired Decoder (ACV + MCCV + 3D agg + opt. 2-stage)
 # ---------------------------
@@ -344,3 +412,5 @@ class SOTAStereoDecoder(nn.Module):
         out["confidence_1_4"] = 1.0 - entropy_map(out["prob_volume_1_4"])
         out["disp_1_4"] = disp_q
         return out
+
+

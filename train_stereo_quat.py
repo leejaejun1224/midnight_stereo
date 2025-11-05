@@ -14,8 +14,7 @@ from torch.utils.data import DataLoader
 # (환경에 맞게 경로 조정)
 # =========================
 from vit_cn import StereoModel
-# ↓↓↓ 당신이 방금 만든 "단일 파일(수정된) Selective-IGEV"의 파일명으로 변경하세요.
-from agg.decoder_selective_igev import IGEVStereo  # e.g., from your_single_file_igev import IGEVStereo
+from agg.aggregator import SOTAStereoDecoder
 
 from tools import (
     set_seed,
@@ -113,7 +112,7 @@ class RealtimeEvalLogger:
             _add("Disp_EPE",    disp_metrics.get("EPE"))
             _add("Disp_D1_all", disp_metrics.get("D1_all"))
             _add("Disp_gt1px",  disp_metrics.get("> 1px"))
-            _add("Disp_gt2px",  disp_metrics.get("> 2 px"))
+            _add("Disp_gt2px",  disp_metrics.get("> 2px"))
 
         if depth_metrics:
             _add("Depth_AbsRel", depth_metrics.get("AbsRel"))
@@ -226,7 +225,7 @@ def unpad_bhwc(x: torch.Tensor, pad_q: Tuple[int, int]) -> torch.Tensor:
 
 
 # =========================
-# 학습 루프 (입력 16배수 패딩 → ViT features + IGEVStereo ← vit_interleaved_1_4)
+# 학습 루프 (입력 16배수 패딩 → 모델 → 출력 언패드, 모든 손실 @1/4 + Full-res 추가)
 # =========================
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -251,48 +250,41 @@ def train(args):
                         shuffle=True, num_workers=args.workers,
                         pin_memory=True, drop_last=True)
 
-    # --- ViT 백본 (features/손실용) ---
+    # --- 모델/디코더 ---
     stereo = StereoModel(
         freeze_vit=True,
         amp=args.amp,
-        autopad_to_8=False,   # 입력은 외부에서 16배수 패딩
+        autopad_to_8=False,   # << 입력은 외부에서 16배수 패딩
     ).to(device).train()
 
-    # --- IGEVStereo (ViT 1/4 피처를 직접 입력) ---
-    #  ※ 당신이 만든 단일파일 IGEV는 __init__(args) 안에서
-    #    args.vit_ch_1_4 가 설정돼 있어야 ViT 어댑터 Conv들이 생성됨
-    class _Cfg:  # 간단한 네임스페이스
-        pass
-    igev_cfg = _Cfg()
-    igev_cfg.hidden_dims     = [int(x) for x in args.igev_hidden_dims.split(",")]  # ex) "128,128,128"
-    igev_cfg.n_downsample    = int(args.igev_n_downsample)
-    igev_cfg.n_gru_layers    = int(args.igev_n_gru_layers)
-    igev_cfg.corr_radius     = int(args.igev_corr_radius)
-    igev_cfg.corr_levels     = int(args.igev_corr_levels)
-    igev_cfg.max_disp        = int(args.max_disp_px)
-    igev_cfg.mixed_precision = bool(args.amp)
-    igev_cfg.precision_dtype = "float16" if args.amp else "float32"
-    igev_cfg.vit_ch_1_4      = int(args.vit_ch_1_4) if int(args.vit_ch_1_4) > 0 else None  # 반드시 맞춰주세요!
-
-    igev = IGEVStereo(igev_cfg).to(device).train()
+    decoder = SOTAStereoDecoder(
+        max_disp_px=args.max_disp_px,
+        fused_in_ch=args.fused_ch,
+        red_ch=args.acv_red_ch,
+        base3d=args.agg_ch,
+        use_motif=args.use_motif,
+        two_stage=args.two_stage,
+        local_radius_cells=args.local_radius
+    ).to(device).train()
 
     ckpt_model = torch.nn.ModuleDict({
         "stereo": stereo,
-        "igev": igev,
+        "decoder": decoder,
     })
 
-    # --- 손실(1/4 + Full-res) ---
+    # --- 손실 (모두 1/4 + Full-res 추가) ---
     dir_loss_fn = DirectionalRelScaleDispLoss(
         sim_thr=args.sim_thr, sim_gamma=args.sim_gamma,
         sample_k=args.sim_sample_k,
         use_dynamic_thr=args.use_dynamic_thr, dynamic_q=args.dynamic_q,
-        vert_up_allow=args.vert_up_allow,
-        vert_down_allow=args.vert_down_allow,
-        horiz_margin=args.horiz_margin,
+        vert_up_allow=args.vert_up_allow,         # 위쪽: Δ ∈ [-1,0]
+        vert_down_allow=args.vert_down_allow,     # 아래: Δ ∈ [0,+1]
+        horiz_margin=args.horiz_margin,           # 가로 대칭 허용
         lambda_v=args.lambda_v, lambda_h=args.lambda_h,
         huber_delta=args.huber_delta_h
     ).to(device)
 
+    # (선택) Feature reprojection loss — args.w_reproj 있을 때만 켜기
     w_reproj = float(getattr(args, "w_reproj", 0.0))
     reprog_loss_fn = None
     if w_reproj > 0.0:
@@ -305,7 +297,7 @@ def train(args):
     photo_crit = PhotometricLoss(weights=[args.photo_l1_w, args.photo_ssim_w])
 
     # --- 옵티마/스케일러 ---
-    params = list(stereo.parameters()) + list(igev.parameters())
+    params = list(stereo.parameters()) + list(decoder.parameters())
     params = [p for p in params if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
@@ -313,7 +305,7 @@ def train(args):
     # --- 체크포인트 재개 ---
     start_epoch = 1
     if args.resume and HAS_CKPT:
-        start_epoch, _, ckpt = resume_from_checkpoint(args, ckpt_model, device)
+        start_epoch, _, ckpt = resume_from_checkpoint(args,ckpt_model, device)
         if (ckpt is not None) and ("optim" in ckpt) and (not args.resume_reset_optim):
             try:
                 optim.load_state_dict(ckpt["optim"]); _move_optimizer_state_to_device(optim, device)
@@ -331,7 +323,7 @@ def train(args):
     rtlog = RealtimeEvalLogger(args.save_dir)
 
     # --- 학습 루프 ---
-    stereo.train(); igev.train()
+    stereo.train(); decoder.train()
     for epoch in range(start_epoch, args.epochs + 1):
         rtlog.start_epoch()
         running = 0.0
@@ -346,65 +338,43 @@ def train(args):
                 imgR_01 = denorm_imagenet(imgR)
 
             # === 1) 입력 16배수 패딩 ===
-            imgL_pad, pad = pad_to_multiple(imgL,  mult=32, mode="replicate")
-            imgR_pad, _   = pad_to_multiple(imgR,  mult=32, mode="replicate")
+            imgL_pad, pad = pad_to_multiple(imgL,  mult=16, mode="replicate")
+            imgR_pad, _   = pad_to_multiple(imgR,  mult=16, mode="replicate")
+
+            # pad = (pad_b, pad_r) 이고, 16배수라서 pad_b%4==0, pad_r%4==0 이 보장됨
             assert pad[0] % 4 == 0 and pad[1] % 4 == 0, "pad must be divisible by 4"
 
-            # === 2) ViT 백본 실행 (손실/IGEV 입력 모두 여기서 얻음) ===
             with torch.cuda.amp.autocast(enabled=args.amp):
+                # 2) 백본/디코더 실행
                 bb_out = stereo(imgL_pad, imgR_pad)
+                pred   = decoder(bb_out)
 
-            # ---- ViT 1/4 features 추출 (BHWC or BCHW 모두 처리) ----
-            vitL_1_4 = bb_out["left"]["vit_interleaved_1_4"]
-            vitR_1_4 = bb_out["right"]["vit_interleaved_1_4"]
+                # 3) 출력 언패드 — 모두 1/4 해상도 좌표계(+Full-res)
+                pad_q = (pad[0] // 4, pad[1] // 4)
 
-            # BCHW 보장
-            if vitL_1_4.dim() == 4 and vitL_1_4.shape[1] != bb_out["left"]["fused_1_4"].shape[1]:
-                # 아마 BHWC일 가능성 있음 → permute
-                # (검사: fused_1_4 는 BCHW, vit_interleaved_1_4 이 BHWC면 C가 마지막)
-                if vitL_1_4.shape[-1] == bb_out["left"]["cossim_feat_1_4"].shape[-1]:
-                    vitL_1_4 = vitL_1_4.permute(0, 3, 1, 2).contiguous()
-                    vitR_1_4 = vitR_1_4.permute(0, 3, 1, 2).contiguous()
-            # 여전히 BCHW가 아닐 경우를 대비한 간단 검증
-            assert vitL_1_4.shape[1] == int(args.vit_ch_1_4), \
-                f"vit_interleaved_1_4 채널({vitL_1_4.shape[1]}) != args.vit_ch_1_4({args.vit_ch_1_4}). '--vit_ch_1_4'를 맞춰주세요."
+                # 예측 disparity 두 버전 유지:
+                # (a) 1/4‑px 단위(photometric/warp/깊이용)
+                disp_q_qpx_padded = pred["disp_1_4"] / 4.0                 # [B,1,Hq_pad,Wq_pad], unit: 1/4‑px
+                disp_q_qpx        = unpad_last2(disp_q_qpx_padded, pad_q)  # [B,1,Hq,Wq],      unit: 1/4‑px
 
-            # === 3) IGEV disparity (ViT 1/4 피처와 함께) ===
-            # IGEV는 내부에서 (2*(x/255)-1) 정규화 → 0~1 복원 뒤 ×255 전달
-            with torch.no_grad():
-                imgL_pad_01 = denorm_imagenet(imgL_pad)
-                imgR_pad_01 = denorm_imagenet(imgR_pad)
-            imgL_pad_255 = imgL_pad_01 * 255.0
-            imgR_pad_255 = imgR_pad_01 * 255.0
+                # (b) px 단위(EPE/D1용)
+                disp_q_px = unpad_last2(pred["disp_1_4"], pad_q)           # [B,1,Hq,Wq],      unit: px
 
-            disp_1_4_px_padded, disp_full_px_padded = igev(
-                imgL_pad_255, imgR_pad_255,
-                vit_left_1_4=vitL_1_4, vit_right_1_4=vitR_1_4,
-                iters=int(args.igev_iters),
-                test_mode=False
-            )
+                # (c) feature들 언패드
+                CS_1_4_padded = bb_out["left"]["cossim_feat_1_4"]  # [B,Hq_pad,Wq_pad,C] (BHWC)
+                CS_1_4        = unpad_bhwc(CS_1_4_padded, pad_q)   # [B,Hq,Wq,C]
+                feat_L = unpad_last2(bb_out["left"]["fused_1_4"],  pad_q)  # [B,C,Hq,Wq]
+                feat_R = unpad_last2(bb_out["right"]["fused_1_4"], pad_q)  # [B,C,Hq,Wq]
 
-            # === 4) 출력 언패드/변환 — 모두 1/4 해상도 좌표계(+Full-res) ===
-            pad_q = (pad[0] // 4, pad[1] // 4)
+                # (d) full-res disparity(px) — 디코더 제공 or 업샘플 fallback
+                if "disp_full" in pred:
+                    disp_full_px_padded = pred["disp_full"]                # [B,1,H_pad,W_pad]
+                    disp_full_px        = unpad_last2(disp_full_px_padded, pad)  # [B,1,H,W]
+                else:
+                    # fallback: 1/4 지도(px)를 ×4 업샘플
+                    disp_full_px = F.interpolate(disp_q_px, scale_factor=4, mode="bilinear", align_corners=False)
 
-            # (a) 1/4‑px 단위(photometric/warp/깊이용): px → 1/4‑px 로 바꿈
-            disp_q_qpx_padded = disp_1_4_px_padded / 4.0                 # [B,1,Hq_pad,Wq_pad], unit: 1/4‑px
-            disp_q_qpx        = unpad_last2(disp_q_qpx_padded, pad_q)    # [B,1,Hq,Wq],        unit: 1/4‑px
-
-            # (b) px 단위(EPE/D1용)
-            disp_q_px = unpad_last2(disp_1_4_px_padded, pad_q)           # [B,1,Hq,Wq],        unit: px
-
-            # (c) feature들 언패드 (StereoModel 산출)
-            CS_1_4_padded = bb_out["left"]["cossim_feat_1_4"]  # [B,Hq_pad,Wq_pad,C] (BHWC)
-            CS_1_4        = unpad_bhwc(CS_1_4_padded, pad_q)   # [B,Hq,Wq,C]
-            feat_L = unpad_last2(bb_out["left"]["vit_interleaved_1_4"],  pad_q)  # [B,C,Hq,Wq]
-            feat_R = unpad_last2(bb_out["right"]["vit_interleaved_1_4"], pad_q)  # [B,C,Hq,Wq]
-
-            # (d) full-res disparity(px)
-            disp_full_px = unpad_last2(disp_full_px_padded, pad)        # [B,1,H,W]
-
-            # === 5) Losses @ 1/4 + Full-res ===
-            with torch.cuda.amp.autocast(enabled=args.amp):
+                # --- Losses @ 1/4 ---
                 roi_1_4 = torch.ones_like(disp_q_qpx)
                 loss_dir    = dir_loss_fn(disp_q_qpx, CS_1_4, roi_1_4) * args.w_dir
                 loss_reproj = (reprog_loss_fn(feat_L, feat_R, disp_q_qpx) * w_reproj) if (w_reproj > 0 and reprog_loss_fn is not None) else 0.0
@@ -424,20 +394,23 @@ def train(args):
                 # Smoothness @1/4
                 loss_smooth_q = get_disparity_smooth_loss(disp_q_qpx, imgL_q01) * args.w_smooth_qres
 
-                # --- Full-res Photometric & Smoothness ---
+                # --- 추가: Full-res Photometric & Smoothness ---
+                # 우→좌 warp (원본 해상도, px 단위)
                 imgR_full_warp, valid_full = warp_right_to_left_image(imgR_01, disp_full_px)
 
+                # Photometric @Full-res
                 photo_map_full  = photo_crit.simple_photometric_loss(imgL_01, imgR_full_warp, weights=[args.photo_l1_w, args.photo_ssim_w])
                 loss_photo_full = (photo_map_full * valid_full).sum() / (valid_full.sum() + 1e-6)
                 loss_photo_full = loss_photo_full * args.w_photo_fullres
 
+                # Smoothness @Full-res
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
 
                 # 총손실
-                if isinstance(loss_reproj, torch.Tensor):
-                    loss = loss_dir + loss_reproj
-                else:
-                    loss = loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
+                loss = (
+                    loss_dir
+                    + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
+                )
                 loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full
 
             # 최적화
@@ -503,7 +476,7 @@ def train(args):
             # 콘솔 로그
             if it % args.log_every == 0:
                 lrp = (loss_reproj.item() if isinstance(loss_reproj, torch.Tensor) else float(loss_reproj)) if (w_reproj > 0) else 0.0
-                print(f"[Epoch {epoch:03d} / {args.epochs:03d}| Iter {it:04d}/{len(loader)}] "
+                print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
                       f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
                       f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
@@ -530,7 +503,7 @@ def train(args):
                 torch.save({
                     "epoch": epoch,
                     "stereo": stereo.state_dict(),
-                    "igev": igev.state_dict(),
+                    "decoder": decoder.state_dict(),
                     "optim": optim.state_dict(),
                     "scaler": scaler.state_dict() if args.amp else None,
                     "args": vars(args)
@@ -541,11 +514,11 @@ def train(args):
 # =========================
 # argparse
 # =========================
+
 from datetime import datetime, timezone, timedelta
 current_time = datetime.now(tz=timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime("%y%m%d_%H%M%S")
-
 def get_args():
-    p = argparse.ArgumentParser("Stereo — ViT 1/4 features → IGEVStereo (two outputs), losses @1/4 + Full-res")
+    p = argparse.ArgumentParser("Stereo — All losses @1/4 + Full-res photometric/smooth (inputs padded to ×16, outputs unpadded)")
 
     # 데이터
     p.add_argument("--left_dir",  type=str, required=True)
@@ -553,22 +526,17 @@ def get_args():
     p.add_argument("--height", type=int, default=384)
     p.add_argument("--width",  type=int, default=1224)
 
-    # 모델/디코더(기존 옵션 유지하되, IGEV만 사용)
+    # 모델/디코더
     p.add_argument("--max_disp_px", type=int, default=64)
-
-    # --- IGEVStereo 하이퍼 ---
-    p.add_argument("--igev_iters",        type=int, default=12)
-    p.add_argument("--igev_corr_radius",  type=int, default=4)
-    p.add_argument("--igev_corr_levels",  type=int, default=4)
-    p.add_argument("--igev_n_gru_layers", type=int, default=3)
-    p.add_argument("--igev_n_downsample", type=int, default=2)
-    p.add_argument("--igev_hidden_dims",  type=str, default="128,128,128")  # "h16,h8,h4"
-
-    # !!! 중요: StereoModel이 내보내는 vit_interleaved_1_4의 채널 수로 맞추세요 !!!
-    p.add_argument("--vit_ch_1_4", type=int, default=320, help="ViT 1/4 feature channels of 'vit_interleaved_1_4'")
+    p.add_argument("--fused_ch",    type=int, default=320)
+    p.add_argument("--acv_red_ch",  type=int, default=48)
+    p.add_argument("--agg_ch",      type=int, default=32)
+    p.add_argument("--use_motif",   type=bool, default=True)
+    p.add_argument("--two_stage",   type=bool, default=True)
+    p.add_argument("--local_radius", type=int, default=8)
 
     # 학습
-    p.add_argument("--epochs",     type=int, default=10)
+    p.add_argument("--epochs",     type=int, default=20)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
@@ -577,27 +545,27 @@ def get_args():
     p.add_argument("--seed",       type=int, default=42)
 
     # 손실 가중치
-    p.add_argument("--w_dir",  type=float, default=1.0)
-    p.add_argument("--w_reproj", type=float, default=1.0)
+    p.add_argument("--w_dir",              type=float, default=1.0)
+    p.add_argument("--w_reproj",           type=float, default=1.0)
     # 1/4 해상도
     p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
     # Full-res 추가
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.1,   help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.01, help="Smoothness  @Full-res")
     # photometric 내부 가중(공통)
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
 
-    # DirectionalRelScaleDispLoss 하이퍼
+    # DirectionalRelScaleDispLoss 하이퍼 (cossim + 세로 [-1,0]/[0,1])
     p.add_argument("--sim_thr",      type=float, default=0.75)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
-    p.add_argument("--sim_sample_k", type=int,   default=1024)
+    p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=1.0)
-    p.add_argument("--vert_down_allow", type=float, default=1.0)
-    p.add_argument("--horiz_margin",    type=float, default=0.0)
+    p.add_argument("--vert_up_allow",   type=float, default=0.4)
+    p.add_argument("--vert_down_allow", type=float, default=0.4)
+    p.add_argument("--horiz_margin",    type=float, default=0.1)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
     p.add_argument("--huber_delta_h", type=float, default=1.0)
@@ -605,7 +573,7 @@ def get_args():
     # 로깅/저장/재개
     p.add_argument("--log_every",   type=int, default=10)
     p.add_argument("--save_every",  type=int, default=1)
-    p.add_argument("--save_dir", type=str, default=f"./log/checkpoints_{current_time}")
+    p.add_argument("--save_dir",    type=str, default="./log/checkpoints_{current_time}")
     p.add_argument("--resume",      type=str, default=None)
     p.add_argument("--resume_reset_optim",  action="store_true")
     p.add_argument("--resume_reset_scaler", action="store_true")
