@@ -169,47 +169,130 @@ def build_interleaved_quarter_features(
     return Fq  # [B,H/4,W/4,C]
 
 
-# -----------------------------
-# Conv 1/4 분기 & 1/4 융합
-# -----------------------------
+# ========== 최소주의 3x3 스택 유틸 ==========
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
+class Conv3x3GNAct(nn.Module):
+    """3x3 conv -> (GN or BN) -> GELU"""
+    def __init__(self, in_ch, out_ch, stride=1, norm='gn', gn_groups=8):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
+        if norm == 'bn':
+            self.norm = nn.BatchNorm2d(out_ch)
+        elif norm == 'gn':
+            self.norm = nn.GroupNorm(gn_groups, out_ch)
+        else:
+            self.norm = nn.Identity()
+        self.act = nn.GELU()
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+class ResBlock3x3(nn.Module):
+    """(3x3, gn, gelu) x2 + 잔차"""
+    def __init__(self, ch, norm='gn', gn_groups=8):
+        super().__init__()
+        self.conv1 = Conv3x3GNAct(ch, ch, stride=1, norm=norm, gn_groups=gn_groups)
+        # 두 번째는 활성화 직전에 합치기 위해 act 없이 norm만
+        self.conv2_conv = nn.Conv2d(ch, ch, 3, 1, 1, bias=False)
+        if norm == 'bn':
+            self.conv2_norm = nn.BatchNorm2d(ch)
+        elif norm == 'gn':
+            self.conv2_norm = nn.GroupNorm(gn_groups, ch)
+        else:
+            self.conv2_norm = nn.Identity()
+        self.act = nn.GELU()
+    def forward(self, x):
+        y = self.conv1(x)
+        y = self.conv2_norm(self.conv2_conv(y))
+        return self.act(x + y)
+
+# ========== Conv 1/4 분기 (3x3-only) ==========
 class ConvQuarter(nn.Module):
     """
-    얕은 Conv stem: 1/2 → 1/4
-    in:  [B,3,H,W]
-    out: [B,Cc,H/4,W/4]
+    순수 3x3 스택:
+      - 1/2: Conv3x3 s=2 -> (ResBlock3x3)*N_half
+      - 1/4: Conv3x3 s=2 -> (ResBlock3x3)*N_quarter
+    out: [B, cc, H/4, W/4]
     """
-    def __init__(self, in_ch: int = 3, cc: int = 192, gn_groups: int = 8):
+    def __init__(
+        self,
+        in_ch: int = 3,
+        cc: int = 256,          # 출력 채널 (기본 256)
+        norm: str = 'gn',
+        gn_groups: int = 8,
+        c_half: int = 128,      # H/2 단계 채널
+        n_blocks_half: int = 2, # 1/2 스케일 블록 수
+        n_blocks_quarter: int = 3, # 1/4 스케일 블록 수
+    ):
         super().__init__()
-        self.conv14 = nn.Sequential(
-            nn.Conv2d(in_ch, 96, 3, 2, 1),
-            nn.GroupNorm(gn_groups, 96),
-            nn.GELU(),
-            nn.Conv2d(96, cc, 3, 2, 1),
-            nn.GroupNorm(gn_groups, cc),
-            nn.GELU(),
-        )
+        # H/2
+        self.s2 = Conv3x3GNAct(in_ch, c_half, stride=2, norm=norm, gn_groups=gn_groups)
+        self.stage_half = nn.Sequential(*[
+            ResBlock3x3(c_half, norm=norm, gn_groups=gn_groups)
+            for _ in range(n_blocks_half)
+        ])
+        # H/4
+        self.s4 = Conv3x3GNAct(c_half, cc, stride=2, norm=norm, gn_groups=gn_groups)
+        self.stage_quarter = nn.Sequential(*[
+            ResBlock3x3(cc, norm=norm, gn_groups=gn_groups)
+            for _ in range(n_blocks_quarter)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv14(x)
+        x = self.s2(x)            # [B,c_half,H/2,W/2]
+        x = self.stage_half(x)
+        x = self.s4(x)            # [B,cc,H/4,W/4]
+        x = self.stage_quarter(x) # [B,cc,H/4,W/4]
+        return x
 
-
+# ========== Fusion 1/4 (3x3-only) ==========
 class Fusion1_4(nn.Module):
     """
-    1/4 스케일에서 Conv(1/4)와 ViT(1/8 업샘플)를 융합.
-    in:  [B, Cc+Cv, H/4, W/4]
-    out: [B, Cf,   H/4, W/4]
+    1/4에서 Conv분기(cc)와 ViT분기(cv)를 concat 후,
+    3x3-only 네트로 Cf로 축소·융합.
+    - 첫 forward 때 v8_up 채널을 읽어 in_conv를 동적 생성(런타임 적응)
     """
-    def __init__(self, cc: int = 192, cv: int = 384, cf: int = 256):
+    def __init__(
+        self,
+        cc: int = 256,
+        cv: int = 0,           # 무시(런타임에서 자동 적응)
+        cf: int = 320,         # 최종 융합 출력 채널 (디코더 fused_in_ch와 일치)
+        norm: str = 'gn',
+        gn_groups: int = 8,
+        n_blocks: int = 2,     # 융합 후 ResBlock 개수
+    ):
         super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Conv2d(cc + cv, cf, 1),
-            nn.GELU(),
-            nn.Conv2d(cf, cf, 3, 1, 1),
-        )
+        self.cc = cc
+        self.cf = cf
+        self.norm = norm
+        self.gn_groups = gn_groups
+        self.n_blocks = n_blocks
+
+        self.in_conv: Optional[nn.Module] = None  # 첫 forward에서 생성
+        self.blocks: Optional[nn.Sequential] = None
+
+    def _build_once(self, in_ch_total: int, device: torch.device):
+        # 입력(cat) -> cf 로 바로 축소 (3x3)
+        self.in_conv = Conv3x3GNAct(
+            in_ch_total, self.cf, stride=1, norm=self.norm, gn_groups=self.gn_groups
+        ).to(device)
+        # 융합 후 3x3 잔차 블록들
+        self.blocks = nn.Sequential(*[
+            ResBlock3x3(self.cf, norm=self.norm, gn_groups=self.gn_groups)
+            for _ in range(self.n_blocks)
+        ]).to(device)
 
     def forward(self, c4: torch.Tensor, v8_up: torch.Tensor) -> torch.Tensor:
+        if self.in_conv is None:
+            in_ch_total = c4.shape[1] + v8_up.shape[1]
+            self._build_once(in_ch_total, c4.device)
         x = torch.cat([c4, v8_up], dim=1)
-        return self.fuse(x)
+        x = self.in_conv(x)
+        x = self.blocks(x)
+        return x
 
 
 # -----------------------------
@@ -328,8 +411,8 @@ class StereoModel(nn.Module):
                 p.requires_grad = False
 
         # Conv 1/4 & Fusion
-        self.conv14 = ConvQuarter(in_ch=3, cc=cc)
-        self.fuse14 = Fusion1_4(cc=cc, cv=cv, cf=cf)
+        self.conv14 = ConvQuarter(in_ch=3, cc=256)
+        self.fuse14 = Fusion1_4(cc=256, cf=320) 
 
         self.to(self.device)
 

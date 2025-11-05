@@ -1,2 +1,0 @@
-[Epoch 001] [Disp] EPE=0.943  D1=5.52%  >1px=31.15%  >2px=11.55%  [Depth] AbsRel=2085.955  RMSE=1676412.074  δ1=0.541  [Depth-W] W/AbsRel=3443.255  W/RMSE=1088568.062  W/δ1=0.531
-[Epoch 001] [Disp] EPE=3.574  D1=40.45%  >1px=76.46%  >2px=56.08%  [Depth] AbsRel=2465.593  RMSE=1975282.293  δ1=0.558  [Depth-W] W/AbsRel=3962.783  W/RMSE=1249532.071  W/δ1=0.544
