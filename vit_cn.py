@@ -165,7 +165,6 @@ def build_interleaved_quarter_features(
     Fq[:, 0::2, 0::2, :] = f44
 
     # L2 정규화 → 내적 == cosine
-    Fq = F.normalize(Fq, dim=-1)
     return Fq  # [B,H/4,W/4,C]
 
 
@@ -438,7 +437,10 @@ class StereoModel(nn.Module):
                 self.vit, img, pad_mode=self.pad_mode_for_interleave, amp=self.amp
             )  # [B,H/4,W/4,C]
         # 언패드
+        Fqn = F.normalize(Fq, dim=-1)
+        
         Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)        # [B,h4,w4,C]
+        Fqn = unpad_1_4_lastdim(Fqn, pad_b, pad_r)        # [B,h4,w4,C]
         # 코스트 볼륨용 NCHW 버전 추가
         Fq_cf = Fq.permute(0, 3, 1, 2).contiguous()     # [B,C,h4,w4]
 
