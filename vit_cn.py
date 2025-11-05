@@ -433,13 +433,14 @@ class StereoModel(nn.Module):
         H, W = Hpad - pad_b, Wpad - pad_r
 
         # 2) CosSim 전용 1/4 피처 (인터리빙, L2 normalized)
-        #    - 비학습(no_grad), AMP, 4시프트 순차 실행
         with torch.no_grad():
             Fq = build_interleaved_quarter_features(
                 self.vit, img, pad_mode=self.pad_mode_for_interleave, amp=self.amp
             )  # [B,H/4,W/4,C]
-        # 언패드 반영
-        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)  # [B,h4,w4,C]
+        # 언패드
+        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)        # [B,h4,w4,C]
+        # 코스트 볼륨용 NCHW 버전 추가
+        Fq_cf = Fq.permute(0, 3, 1, 2).contiguous()     # [B,C,h4,w4]
 
         # 3) ViT 1/8 토큰 (학습/동결 옵션)
         tokens_hw = extract_vit_1_8_tokens(
@@ -457,10 +458,11 @@ class StereoModel(nn.Module):
         F4 = self.fuse14(C4, V8_up)                                                          # [B,Cf,H/4,W/4]
 
         return {
-            "fused_1_4":       F4,   # 다운스트림용
-            "cossim_feat_1_4": Fq,   # L2 normalized, cos 전용 (채널 마지막)
-            "vit_1_8":         V8,   # 필요시 사용
-            "conv_1_4":        C4,   # 필요시 사용
+            "fused_1_4":         F4,      # 다운스트림용
+            "cossim_feat_1_4":   Fq,      # L2 normalized, 채널-마지막 [B,H/4,W/4,C]
+            "vit_interleaved_1_4": Fq_cf, # L2 normalized, 채널-우선   [B,C,H/4,W/4]  <-- 추가된 부분
+            "vit_1_8":           V8,      # 필요시 사용
+            "conv_1_4":          C4,      # 필요시 사용
         }
 
     # ---- 스테레오 입력 (좌/우) ----

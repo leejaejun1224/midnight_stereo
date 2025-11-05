@@ -21,7 +21,7 @@ def load_dino(device: torch.device):
     facebookresearch/dino의 ViT-S/8 (dino_vits8) 모델 로드.
     - 가변 입력 크기 지원(포지셔널 임베딩 내부 보간)
     """
-    model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
+    model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
     model.eval().to(device)
     return model
 

@@ -1,2 +1,4 @@
 log/
+out_dir/
+out_dir_0.9_posemb/
 __pycache__/
