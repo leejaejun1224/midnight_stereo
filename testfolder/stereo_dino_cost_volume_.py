@@ -1,5 +1,7 @@
+# -*- coding: utf-8 -*-
 import argparse
 from pathlib import Path
+import math
 
 import numpy as np
 from PIL import Image
@@ -19,8 +21,7 @@ IMG_EXTS = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
 
 def load_dino(device: torch.device):
     """
-    facebookresearch/dino의 ViT-B/8 (dino_vitb8) 모델 로드.
-    - 가변 입력 크기 지원(포지셔널 임베딩 내부 보간)
+    facebookresearch/dino 의 ViT-B/8(dino_vitb8) 로드
     """
     model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
     model.eval().to(device)
@@ -39,13 +40,12 @@ def pil_to_tensor(img_pil: Image.Image) -> torch.Tensor:
 
 
 # ===========================================
-# 1) ViT-S/8 패치 토큰 추출 + 1/4 격자 생성(학습 없음)
+# 1) ViT-B/8 패치 토큰 추출 + 1/4 격자 생성(학습 없음)
 #    (0/4 px 시프트-패딩 4회 → 인터리빙)
 # ===========================================
 @torch.no_grad()
 def _extract_patch_tokens_dino(model, x: torch.Tensor) -> torch.Tensor:
     """
-    DINO의 get_intermediate_layers를 사용해 마지막 레이어 패치 토큰을 [H8,W8,C]로 반환.
     입력 x: [1,3,Hpad,Wpad] (이미 패딩 완료본)
     반환: [H8, W8, C]  (CLS 토큰 제거)
     """
@@ -65,12 +65,10 @@ def _extract_patch_tokens_dino(model, x: torch.Tensor) -> torch.Tensor:
     tokens_hw = tokens.reshape(B, h8, w8, C).squeeze(0).contiguous()  # [H8,W8,C]
     return tokens_hw
 
-
 @torch.no_grad()
 def _shift_once(model, img_tensor: torch.Tensor, dx: int, dy: int, pad_mode='replicate') -> torch.Tensor:
     """
-    (dx,dy) ∈ {0,4} 시프트-패딩 한 입력에서 패치 토큰을 추출.
-    오른쪽/아래는 stride=8 정합을 위해 자동 패딩.
+    (dx,dy) ∈ {0,4} 시프트-패딩 입력에서 패치 토큰을 추출.
     반환: [H//8, W//8, C] (원본 영역 기준으로 잘라냄)
     """
     _, _, H, W = img_tensor.shape
@@ -83,22 +81,19 @@ def _shift_once(model, img_tensor: torch.Tensor, dx: int, dy: int, pad_mode='rep
 
     H8 = H // 8
     W8 = W // 8
-    tokens = tokens[:H8, :W8, :]  # 원본 범위만 사용
+    tokens = tokens[:H8, :W8, :]
     return tokens
-
 
 @torch.no_grad()
 def build_quarter_features(model, img_tensor: torch.Tensor) -> torch.Tensor:
     """
-    4개 오프셋 (0,0), (4,0), (0,4), (4,4) → 인터리빙하여
-    최종 1/4 해상도 [H//4, W//4, C] 피처맵을 생성 (L2 정규화 포함).
+    최종 1/4 해상도 [H//4, W//4, C] 피처맵 생성 (L2 정규화 포함).
     """
     device = next(model.parameters()).device
     img_tensor = img_tensor.to(device, non_blocking=True)
 
     _, _, H, W = img_tensor.shape
-    assert H % 8 == 0 and W % 8 == 0, \
-        "입력 H,W는 8의 배수여야 합니다. (--pad_to_8 옵션으로 자동 패딩 가능)"
+    assert H % 8 == 0 and W % 8 == 0, "입력 H,W는 8의 배수여야 합니다. (--pad_to_8 권장)"
 
     H4, W4 = H // 4, W // 4
 
@@ -110,14 +105,13 @@ def build_quarter_features(model, img_tensor: torch.Tensor) -> torch.Tensor:
     C = f00.shape[-1]
     Fq = torch.empty((H4, W4, C), device=device, dtype=f00.dtype)
 
-    # 인터리빙 규칙:
-    Fq[1::2, 1::2, :] = f00  # (0,0)
-    Fq[1::2, 0::2, :] = f40  # (4,0)
-    Fq[0::2, 1::2, :] = f04  # (0,4)
-    Fq[0::2, 0::2, :] = f44  # (4,4)
+    # 인터리빙
+    Fq[1::2, 1::2, :] = f00
+    Fq[1::2, 0::2, :] = f40
+    Fq[0::2, 1::2, :] = f04
+    Fq[0::2, 0::2, :] = f44
 
-    # 코사인 유사도 계산을 위한 L2 정규화
-    Fq = F.normalize(Fq, dim=-1)
+    Fq = F.normalize(Fq, dim=-1)  # 코사인 유사도용 L2 정규화
     return Fq  # [H4,W4,C]
 
 
@@ -128,10 +122,7 @@ def build_quarter_features(model, img_tensor: torch.Tensor) -> torch.Tensor:
 def build_cost_volume(featL: torch.Tensor, featR: torch.Tensor, max_disp: int) -> torch.Tensor:
     """
     featL, featR: [H4, W4, C] (L2 정규화됨)
-    max_disp: 1/4 격자 단위의 최대 disparity (포함, 즉 0..max_disp)
-
-    반환: cost_vol [D+1, H4, W4] (각 d에서 L·Rshift 내적 = cos sim)
-    - 정의: E(d)[y,x] = dot( featL[y,x], featR[y,x-d] )  (x-d<0는 invalid)
+    반환: cost_vol [D+1, H4, W4]
     """
     assert featL.shape == featR.shape
     H4, W4, C = featL.shape
@@ -148,81 +139,213 @@ def build_cost_volume(featL: torch.Tensor, featR: torch.Tensor, max_disp: int) -
             left_slice  = featL[:, d:, :]      # [H4, W4-d, C]
             right_slice = featR[:, :-d, :]     # [H4, W4-d, C]
             sim = (left_slice * right_slice).sum(dim=-1)  # [H4, W4-d]
-            cost_vol[d, :, d:] = sim  # invalid 구간(0..d-1)은 -inf 유지
+            cost_vol[d, :, d:] = sim  # invalid(0..d-1)은 -inf 유지
 
     return cost_vol  # [D+1,H4,W4]
-
 
 @torch.no_grad()
 def argmax_disparity(cost_vol: torch.Tensor):
     """
-    cost_vol: [D+1, H4, W4]
     반환:
-      - disp_map: [H4,W4] (long), 각 위치에서 argmax disparity
-      - peak_sim: [H4,W4] (float), 해당 disparity에서의 유사도 값
+      - disp_map: [H4,W4] (long)
+      - peak_sim: [H4,W4] (float)
     """
-    peak_sim, disp_map = cost_vol.max(dim=0)  # over disparity axis
+    peak_sim, disp_map = cost_vol.max(dim=0)
     return disp_map, peak_sim
 
 
 # ===========================================
-# 2-1) Entropy map from cost volume
+# 2-1) Entropy / Gap
 # ===========================================
 @torch.no_grad()
 def build_entropy_map(cost_vol: torch.Tensor,
                       T: float = 0.1,
                       eps: float = 1e-8,
                       normalize: bool = True) -> torch.Tensor:
-    """
-    cost_vol: [D+1, H4, W4]  (invalid는 -inf)
-    T: temperature (작을수록 분포가 날카로워져 엔트로피가 낮아짐)
-    반환: ent_map [H4, W4], (정규화 시 0..1)
-    """
-    # per-pixel max로 중심 이동
-    m = torch.amax(cost_vol, dim=0, keepdim=True)              # [1,H4,W4]
-    logits = (cost_vol - m) / max(T, eps)                      # [D+1,H4,W4]
+    m = torch.amax(cost_vol, dim=0, keepdim=True)
+    logits = (cost_vol - m) / max(T, eps)
 
-    prob = torch.softmax(logits, dim=0)                        # [D+1,H4,W4]
+    prob = torch.softmax(logits, dim=0)
     p = prob.clamp_min(eps)
-    ent = -(p * p.log()).sum(dim=0)                            # [H4,W4]
+    ent = -(p * p.log()).sum(dim=0)  # [H4,W4]
 
     if normalize:
-        valid = torch.isfinite(cost_vol)                       # [D+1,H4,W4]
-        Deff  = valid.sum(dim=0).clamp_min(1).to(p.dtype)      # [H4,W4]
+        valid = torch.isfinite(cost_vol)
+        Deff  = valid.sum(dim=0).clamp_min(1).to(p.dtype)
         ent = torch.where(Deff > 1, ent / (Deff.log() + eps), torch.zeros_like(ent))
         ent = ent.clamp_(0.0, 1.0)
     return ent
 
-
-# ===========================================
-# 2-2) Top-2 disparity index gap from cost volume
-# ===========================================
 @torch.no_grad()
 def build_top2_gap_map(cost_vol: torch.Tensor) -> torch.Tensor:
-    """
-    cost_vol: [D+1, H4, W4]  (invalid는 -inf)
-    반환: gap_map [H4, W4] (float)
-      - 각 픽셀에서 상위 2개 후보 disparity 인덱스의 절대 차이 |d1 - d2|
-      - 유효 후보가 2개 미만이면 NaN으로 둬서 시각화 시 투명 처리
-    """
     Dp1 = cost_vol.shape[0]
     if Dp1 < 2:
-        # disparity 후보가 1개뿐이면 전부 NaN
         H4, W4 = cost_vol.shape[1:]
         return torch.full((H4, W4), float('nan'), device=cost_vol.device, dtype=cost_vol.dtype)
 
-    valid = torch.isfinite(cost_vol)                 # [D+1,H4,W4]
-    Deff  = valid.sum(dim=0)                         # [H4,W4]
+    valid = torch.isfinite(cost_vol)
+    Deff  = valid.sum(dim=0)
 
-    # 상위 2개 값/인덱스
-    vals, idxs = torch.topk(cost_vol, k=2, dim=0)   # [2,H4,W4], [2,H4,W4]
+    _, idxs = torch.topk(cost_vol, k=2, dim=0)   # [2,H4,W4]
     d1 = idxs[0].to(torch.float32)
     d2 = idxs[1].to(torch.float32)
-    gap = (d1 - d2).abs()                           # [H4,W4]
-
-    # 유효 후보가 2개 미만인 곳은 NaN
+    gap = (d1 - d2).abs()
     gap = torch.where(Deff >= 2, gap, torch.full_like(gap, float('nan')))
     return gap
+
+
+# ===========================================
+# NEW) ROI ∩ (entropy > thr)만 adaptive window 재매칭
+#      재매칭 후 entropy로 시각화에서 새로 포함될 수 있게 함
+# ===========================================
+@torch.no_grad()
+def _invalid_run_extents(entropy: torch.Tensor, thr: float):
+    """
+    entropy: [H4,W4]
+    반환: a,b, invalid
+      - invalid = (entropy > thr)
+      - (y,x)에서 좌/우로 '연속 invalid'만 지나 '첫 valid(<=thr)' 직전까지 확장
+      - 경계에 valid 없으면 영상 경계까지
+    """
+    H4, W4 = entropy.shape
+    device = entropy.device
+    valid = (entropy <= float(thr))
+    invalid = ~valid
+    x = torch.arange(W4, device=device).view(1, W4).expand(H4, -1)
+
+    # 왼쪽 마지막 valid (없으면 -1)
+    left_valid_idx = torch.where(valid, x, torch.full_like(x, -1))
+    prev_valid = torch.cummax(left_valid_idx, dim=1)[0]
+
+    # 오른쪽 첫 valid (없으면 W4)
+    valid_rev = torch.flip(valid, dims=[1])
+    idx_rev = torch.where(valid_rev, x, torch.full_like(x, -1))
+    prev_rev = torch.cummax(idx_rev, dim=1)[0]
+    prev_rev = torch.flip(prev_rev, dims=[1])
+    next_valid = (W4 - 1) - prev_rev
+    next_valid = torch.where(prev_rev >= 0, next_valid, torch.full_like(next_valid, W4))
+
+    # 연속 invalid만 포함
+    L = (x - prev_valid - 1).clamp_min(0)
+    R = (next_valid - x - 1).clamp_min(0)
+    a = (x - L).clamp_min(0).to(torch.long)
+    b = (x + R).clamp_max(W4 - 1).to(torch.long)
+    return a, b, invalid
+
+@torch.no_grad()
+def build_roi_mask(H4: int, W4: int,
+                   mode: str,
+                   u0: float, u1: float,
+                   v0: float, v1: float,
+                   device: torch.device) -> torch.Tensor:
+    """
+    ROI 마스크 생성 (1/4 격자 기준)
+    - mode='frac': u0,u1,v0,v1 ∈ [0,1], 비율(좌상 원점), u∈[0..1], v∈[0..1]
+    - mode='abs4': u0,u1,v0,v1 는 1/4 격자 인덱스(정수 권장, inclusive)
+    반환: [H4,W4] bool
+    """
+    mode = str(mode).lower()
+    if mode not in ("frac", "abs4"):
+        raise ValueError("roi_mode must be 'frac' or 'abs4'.")
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    if mode == "frac":
+        u0f = clamp(float(u0), 0.0, 1.0)
+        u1f = clamp(float(u1), 0.0, 1.0)
+        v0f = clamp(float(v0), 0.0, 1.0)
+        v1f = clamp(float(v1), 0.0, 1.0)
+        if u1f < u0f: u0f, u1f = u1f, u0f
+        if v1f < v0f: v0f, v1f = v1f, v0f
+
+        u0i = int(math.floor(u0f * W4))
+        u1i = int(math.ceil (u1f * W4) - 1)
+        v0i = int(math.floor(v0f * H4))
+        v1i = int(math.ceil (v1f * H4) - 1)
+    else:
+        # abs4 (인덱스 inclusive)
+        u0i = int(round(u0))
+        u1i = int(round(u1))
+        v0i = int(round(v0))
+        v1i = int(round(v1))
+        if u1i < u0i: u0i, u1i = u1i, u0i
+        if v1i < v0i: v0i, v1i = v1i, v0i
+
+    u0i = clamp(u0i, 0, W4 - 1)
+    u1i = clamp(u1i, 0, W4 - 1)
+    v0i = clamp(v0i, 0, H4 - 1)
+    v1i = clamp(v1i, 0, H4 - 1)
+
+    mask = torch.zeros(H4, W4, dtype=torch.bool, device=device)
+    if (u1i >= u0i) and (v1i >= v0i):
+        mask[v0i:v1i+1, u0i:u1i+1] = True
+    return mask
+
+@torch.no_grad()
+def refine_cost_for_uncertain_roi(cost_vol: torch.Tensor,
+                                  entropy_before: torch.Tensor,
+                                  ent_thr: float,
+                                  roi_mask: torch.Tensor,
+                                  max_half: int = None,
+                                  ent_T: float = 0.1):
+    """
+    cost_vol: [D+1,H4,W4]
+    entropy_before: [H4,W4]
+    roi_mask: [H4,W4] bool (1/4 격자)
+    ent_thr: 시각화/유효 판단 임계
+    return:
+      cost_vol_ref:  [D+1,H4,W4]  (ROI∩invalid만 갱신)
+      entropy_after: [H4,W4]      (보정 후 전체 엔트로피)
+      refine_mask:   [H4,W4]      (ROI∩invalid)
+    """
+    Dp1, H4, W4 = cost_vol.shape
+    device = cost_vol.device
+
+    # invalid-run 윈도우
+    a, b, invalid = _invalid_run_extents(entropy_before, ent_thr)   # [H4,W4]
+    refine_mask = (roi_mask & invalid)                              # ROI ∩ invalid
+
+    if max_half is not None:
+        x = torch.arange(W4, device=device).view(1, W4).expand(H4, -1)
+        a = torch.max(a, (x - max_half).clamp_min(0))
+        b = torch.min(b, (x + max_half).clamp_max(W4 - 1))
+
+    # 가로 prefix-sum (d-평면별)
+    finite = torch.isfinite(cost_vol)
+    cv = torch.where(finite, cost_vol, torch.zeros_like(cost_vol))   # -inf → 0
+    pref = torch.zeros(Dp1, H4, W4 + 1, device=device, dtype=cv.dtype)
+    pref[:, :, 1:] = torch.cumsum(cv, dim=2)
+    cnt  = torch.zeros(Dp1, H4, W4 + 1, device=device, dtype=cv.dtype)
+    cnt[:, :, 1:] = torch.cumsum(finite.to(cv.dtype), dim=2)
+
+    a_idx = a.unsqueeze(0).expand(Dp1, -1, -1)
+    b_idx = (b + 1).unsqueeze(0).expand(Dp1, -1, -1)
+    num = pref.gather(2, b_idx) - pref.gather(2, a_idx)
+    den = cnt.gather(2, b_idx) - cnt.gather(2, a_idx)
+    agg = num / den.clamp_min(1.0)
+    agg = torch.where(den > 0, agg, torch.full_like(agg, float('-inf')))
+
+    # ROI∩invalid 위치만 치환
+    cost_vol_ref = torch.where(refine_mask.unsqueeze(0), agg, cost_vol)
+
+    # 보정 후 엔트로피(전체) — 시각화 마스크 합집합 계산에 사용
+    entropy_after = build_entropy_map(cost_vol_ref, T=ent_T, normalize=True)
+    return cost_vol_ref, entropy_after, refine_mask
+
+@torch.no_grad()
+def build_union_viz_mask(ent_before: torch.Tensor,
+                         ent_after: torch.Tensor,
+                         thr: float,
+                         roi_mask: torch.Tensor):
+    """
+    ent_before/ent_after: [H4,W4] (torch)
+    roi_mask: [H4,W4] (bool)  — ROI 위치에서만 after 반영
+    return: mask_union [H4,W4] (bool)
+    """
+    m0 = (ent_before <= float(thr))
+    m1 = (ent_after  <= float(thr)) & roi_mask
+    return (m0 | m1)
 
 
 # ===========================================
@@ -230,12 +353,12 @@ def build_top2_gap_map(cost_vol: torch.Tensor) -> torch.Tensor:
 # ===========================================
 def upsample_nearest_4x(map_2d: np.ndarray) -> np.ndarray:
     """
-    [H4,W4] → [H4*4, W4*4] 간단 최근접 업샘플(시각화용)
+    [H4,W4] → [H4*4, W4*4] 최근접 업샘플(시각화용)
     """
     return np.kron(map_2d, np.ones((4, 4), dtype=map_2d.dtype))
 
 def _get_transparent_disp_cmap():
-    # turbo가 없거나 with_extremes 미지원일 때를 대비해 안전 처리
+    # turbo가 없거나 with_extremes 미지원 대비
     try:
         cmap = cm.get_cmap('turbo')
     except Exception:
@@ -261,16 +384,20 @@ def visualize_results(left_img_pil: Image.Image,
                       entropy_map: np.ndarray = None,
                       ent_vis_thr: float = None,
                       top2_gap_map: np.ndarray = None,
-                      gap_min: float = 2.0):
+                      gap_min: float = 2.0,
+                      mask_override: np.ndarray = None):
     """
-    (기존) 4-up(또는 3-up) Figure를 화면/파일로 출력
-    + top2_gap_map 추가 시, 패널 1개 추가(최대 5-up)
+    4~5패널 시각화.
+    mask_override가 주어지면 그 마스크로 disparity를 가림(엔트로피 대신).
     """
     img_np = np.asarray(left_img_pil)
 
-    # 엔트로피 마스크 적용 (disparity에만)
+    # 마스크 적용 (disparity에만)
     disp_for_vis = disp_map.copy()
-    if entropy_map is not None and ent_vis_thr is not None:
+    if mask_override is not None:
+        mask_q = mask_override.astype(bool)
+        disp_for_vis = np.where(mask_q, disp_for_vis, np.nan)
+    elif entropy_map is not None and ent_vis_thr is not None:
         mask_q = (entropy_map <= float(ent_vis_thr))
         disp_for_vis = np.where(mask_q, disp_for_vis, np.nan)
 
@@ -297,7 +424,7 @@ def visualize_results(left_img_pil: Image.Image,
     ax0 = axes[0]
     ax0.imshow(img_np)
     im0 = ax0.imshow(disp_up, vmin=0, vmax=max_disp, alpha=0.55, cmap=cmap_disp)
-    ax0.set_title("Left image + disparity overlay (masked by entropy)")
+    ax0.set_title("Left image + disparity overlay")
     ax0.axis("off")
     cbar0 = fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
     cbar0.set_label("disparity (grid units; ~pixels = disp*4)")
@@ -305,7 +432,7 @@ def visualize_results(left_img_pil: Image.Image,
     # (2) disparity
     ax1 = axes[1]
     im1 = ax1.imshow(disp_up, vmin=0, vmax=max_disp, cmap=cmap_disp)
-    ax1.set_title("Disparity map (entropy-masked; nearest x4)")
+    ax1.set_title("Disparity map (nearest x4)")
     ax1.axis("off")
     cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
     cbar1.set_label("disparity")
@@ -324,21 +451,21 @@ def visualize_results(left_img_pil: Image.Image,
     if has_ent:
         ax = axes[col_idx]; col_idx += 1
         im = ax.imshow(ent_up, vmin=0.0, vmax=1.0, cmap='magma')
-        ax.set_title("Entropy of disparity candidates (0..1)")
+        ax.set_title("Entropy (0..1)")
         ax.axis("off")
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("normalized entropy")
 
-    # (5) top-2 disparity gap (옵션) — 차이<gap_min 은 투명
+    # (5) top-2 gap (옵션)
     if has_gap:
         ax = axes[col_idx]
         gap_vis = np.where(gap_up >= float(gap_min), gap_up, np.nan)
         cmap_gap = _get_transparent_disp_cmap()
         im = ax.imshow(gap_vis, vmin=float(gap_min), vmax=max_disp, cmap=cmap_gap)
-        ax.set_title(f"Top-2 disparity index gap (>= {gap_min}; grid units)")
+        ax.set_title(f"Top-2 disparity index gap (>= {gap_min})")
         ax.axis("off")
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("abs(d1 - d2)")
+        cbar.set_label("|d1 - d2|")
 
     plt.tight_layout()
 
@@ -359,14 +486,15 @@ def save_viz_panels(left_img_pil: Image.Image,
                     out_dir: Path,
                     stem: str,
                     top2_gap_map: np.ndarray = None,
-                    gap_min: float = 2.0):
+                    gap_min: float = 2.0,
+                    mask_override: np.ndarray = None):
     """
-    현재 5개의 시각화 결과를 개별 PNG로 저장:
+    개별 PNG 저장:
       - overlay/<stem>.png
       - disp/<stem>.png
       - peak_sim/<stem>.png
       - entropy/<stem>.png
-      - top2_gap/<stem>.png
+      - top2_gap/<stem>.png (옵션)
     """
     out_dir = Path(out_dir)
     (out_dir / "overlay").mkdir(parents=True, exist_ok=True)
@@ -379,11 +507,13 @@ def save_viz_panels(left_img_pil: Image.Image,
     img_np = np.asarray(left_img_pil)
     H, W = img_np.shape[:2]
 
-    # ---- 엔트로피 마스크 적용(1/4 그리드) ----
-    disp_for_vis = disp_map.copy()
-    if entropy_map is not None and ent_vis_thr is not None:
+    # ---- 마스크 적용(1/4 그리드) ----
+    if mask_override is not None:
+        mask_q = mask_override.astype(bool)
+    else:
         mask_q = (entropy_map <= float(ent_vis_thr))
-        disp_for_vis = np.where(mask_q, disp_for_vis, np.nan)
+
+    disp_for_vis = np.where(mask_q, disp_map, np.nan)
 
     # 1/4 → 원본 크기
     disp_up = upsample_nearest_4x(disp_for_vis).astype(np.float32)  # [H,W]
@@ -426,7 +556,7 @@ def save_viz_panels(left_img_pil: Image.Image,
     fig.savefig(sim_path, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
 
-    # (4) entropy (0..1)
+    # (4) entropy (0..1) — before를 그대로 저장(일관성)
     fig = plt.figure(figsize=(7, 7))
     ax = fig.add_subplot(111)
     im = ax.imshow(ent_up, vmin=0.0, vmax=1.0, cmap="magma")
@@ -463,7 +593,7 @@ def save_viz_panels(left_img_pil: Image.Image,
 # ===========================================
 def pad_right_bottom_to_multiple(img_pil: Image.Image, mult: int = 8) -> Image.Image:
     """
-    입력 이미지를 오른쪽/아래 방향으로만 패딩해서 (H,W)가 mult의 배수가 되도록 맞춤.
+    입력 이미지를 오른쪽/아래 방향으로만 패딩해서 (H,W)가 mult의 배수로.
     """
     W, H = img_pil.size
     pad_w = (mult - (W % mult)) % mult
@@ -479,11 +609,11 @@ def pad_right_bottom_to_multiple(img_pil: Image.Image, mult: int = 8) -> Image.I
 # 5) 메인
 # ===========================================
 def main():
-    parser = argparse.ArgumentParser(description="Stereo cost-volume with DINO ViT-B/8 (1/4 grid)")
-    # 단일 파일 모드(기존)
+    parser = argparse.ArgumentParser(description="Stereo cost-volume with DINO ViT-B/8 (1/4 grid) + ROI adaptive window (invalid-only, ROI by u/v bounds)")
+    # 단일 파일 모드
     parser.add_argument("--left",  type=str, default=None, help="Left image path")
     parser.add_argument("--right", type=str, default=None, help="Right image path")
-    # 디렉터리 모드(신규)
+    # 디렉터리 모드
     parser.add_argument("--left_dir",  type=str, default=None, help="Directory of left images")
     parser.add_argument("--right_dir", type=str, default=None, help="Directory of right images")
     parser.add_argument("--glob", type=str, default="*.png", help="Glob pattern for left images in left_dir")
@@ -497,16 +627,26 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./out_dir",
                         help="(Directory mode) Root output directory for panels")
     parser.add_argument("--save_numpy", action="store_true",
-                        help="(Directory mode) Also save disp/peak_sim/entropy/top2_gap as npz under out_dir/npy")
+                        help="(Directory mode) Save disp/peak_sim/entropy_before/entropy_after/top2_gap/viz_mask as npz")
 
+    # 엔트로피/시각화
     parser.add_argument("--ent_T", type=float, default=0.1,
                         help="Temperature for entropy; smaller → sharper distribution (try 0.05~0.2)")
-    parser.add_argument("--ent_vis_thr", type=float, default=0.9,
-                        help="Only plot disparity where entropy <= this threshold; others are hidden.")
+    parser.add_argument("--ent_vis_thr", type=float, default=0.6,
+                        help="Visualization threshold: show disparity where entropy <= thr")
 
-    # NEW: gap 시각화 임계
-    parser.add_argument("--gap_min", type=float, default=1.0,
-                        help="Visualize top-2 disparity index gap >= this threshold (grid units; ~pixels = gap*4)")
+    # (옵션) 윈도우 반폭 상한(1/4 격자 픽셀 수)
+    parser.add_argument("--win_half_max", type=int, default=None,
+                        help="Cap for half window size on 1/4 grid (None: unlimited)")
+
+    # -------- ROI: u,v 각각 상/하한 지정 --------
+    parser.add_argument("--roi_mode", type=str, default="frac", choices=["frac", "abs4"],
+                        help="ROI bounds mode: 'frac' in [0,1], or 'abs4' in 1/4-grid indices (inclusive).")
+    # 기본: u 전체, v는 아래 1/3
+    parser.add_argument("--roi_u0", type=float, default=0.3, help="Left bound of ROI in u (frac or abs4).")
+    parser.add_argument("--roi_u1", type=float, default=0.7, help="Right bound of ROI in u (frac or abs4).")
+    parser.add_argument("--roi_v0", type=float, default=2/3, help="Top bound of ROI in v (frac or abs4).")
+    parser.add_argument("--roi_v1", type=float, default=1.0, help="Bottom bound of ROI in v (frac or abs4).")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -520,7 +660,7 @@ def main():
     if dir_mode and file_mode:
         raise AssertionError("단일 파일 모드와 디렉터리 모드를 동시에 사용할 수 없습니다.")
 
-    # DINO 모델은 한 번만 로드
+    # DINO 모델 1회 로드
     model = load_dino(device)
 
     if file_mode:
@@ -549,23 +689,45 @@ def main():
             featL = build_quarter_features(model, xL)  # [H//4,W//4,C]
             featR = build_quarter_features(model, xR)
 
-            cost_vol = build_cost_volume(featL, featR, args.max_disp)
-            disp_map_t, peak_sim_t = argmax_disparity(cost_vol)
-            entropy_t  = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)
-            top2_gap_t = build_top2_gap_map(cost_vol)  # NEW
+            cost_vol = build_cost_volume(featL, featR, args.max_disp)          # [D+1,H4,W4]
+            entropy_before = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)  # [H4,W4]
+
+            # ROI 마스크 (u,v 상/하한)
+            _, H4, W4 = cost_vol.shape
+            roi_mask = build_roi_mask(H4, W4,
+                                      args.roi_mode,
+                                      args.roi_u0, args.roi_u1,
+                                      args.roi_v0, args.roi_v1,
+                                      device=entropy_before.device)
+
+            # ---- ROI∩invalid만 adaptive window 재추정 ----
+            cost_vol_ref, entropy_after, refine_mask = refine_cost_for_uncertain_roi(
+                cost_vol, entropy_before, ent_thr=args.ent_vis_thr,
+                roi_mask=roi_mask, max_half=args.win_half_max, ent_T=args.ent_T
+            )
+
+            # 최종 추정은 보정된 볼륨로
+            disp_map_t, peak_sim_t = argmax_disparity(cost_vol_ref)
+            top2_gap_t = build_top2_gap_map(cost_vol_ref)
+
+            # 시각화 마스크 = (before≤thr) ∪ (after≤thr in ROI)
+            viz_mask = build_union_viz_mask(entropy_before, entropy_after, args.ent_vis_thr, roi_mask)
 
         disp_map = disp_map_t.detach().cpu().numpy().astype(np.int32)
         peak_sim = peak_sim_t.detach().cpu().numpy().astype(np.float32)
-        entropy  = entropy_t.detach().cpu().numpy().astype(np.float32)
-        top2_gap = top2_gap_t.detach().cpu().numpy().astype(np.float32)  # NEW
+        ent_before_np = entropy_before.detach().cpu().numpy().astype(np.float32)  # (패널: before 유지)
+        ent_after_np  = entropy_after.detach().cpu().numpy().astype(np.float32)
+        top2_gap = top2_gap_t.detach().cpu().numpy().astype(np.float32)
+        viz_mask_np = viz_mask.detach().cpu().numpy().astype(bool)
 
         visualize_results(
             L_pil, disp_map, peak_sim, args.max_disp,
             save_path=Path(args.save_fig) if args.save_fig else None,
-            entropy_map=entropy,
+            entropy_map=ent_before_np,          # entropy 패널은 'before'를 그대로
             ent_vis_thr=args.ent_vis_thr,
-            top2_gap_map=top2_gap,        # NEW
-            gap_min=args.gap_min          # NEW
+            top2_gap_map=top2_gap,
+            gap_min=1.0,
+            mask_override=viz_mask_np           # 합집합 마스크로 표시
         )
         return
 
@@ -592,7 +754,6 @@ def main():
             cand = right_dir / f"{stem}{ext}"
             if cand.exists():
                 return cand
-        # 확장자/이름이 다르면 실패
         return None
 
     processed, skipped = 0, 0
@@ -629,32 +790,52 @@ def main():
             xL = pil_to_tensor(L_pil)
             xR = pil_to_tensor(R_pil)
 
-            # 5) 특징/코스트/추정
+            # 5) 특징/코스트/보정/추정
             with torch.no_grad():
                 featL = build_quarter_features(model, xL)
                 featR = build_quarter_features(model, xR)
 
-                cost_vol = build_cost_volume(featL, featR, args.max_disp)
-                disp_map_t, peak_sim_t = argmax_disparity(cost_vol)
-                entropy_t  = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)
-                top2_gap_t = build_top2_gap_map(cost_vol)  # NEW
+                cost_vol = build_cost_volume(featL, featR, args.max_disp)            # [D+1,H4,W4]
+                entropy_before = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)
+
+                # ROI 마스크
+                _, H4, W4 = cost_vol.shape
+                roi_mask = build_roi_mask(H4, W4,
+                                          args.roi_mode,
+                                          args.roi_u0, args.roi_u1,
+                                          args.roi_v0, args.roi_v1,
+                                          device=entropy_before.device)
+
+                cost_vol_ref, entropy_after, refine_mask = refine_cost_for_uncertain_roi(
+                    cost_vol, entropy_before, ent_thr=args.ent_vis_thr,
+                    roi_mask=roi_mask, max_half=args.win_half_max, ent_T=args.ent_T
+                )
+
+                disp_map_t, peak_sim_t = argmax_disparity(cost_vol_ref)
+                top2_gap_t = build_top2_gap_map(cost_vol_ref)
+
+                # 시각화 마스크 = (before≤thr) ∪ (after≤thr in ROI)
+                viz_mask = build_union_viz_mask(entropy_before, entropy_after, 1.0, roi_mask)
 
             # 6) NumPy 변환
             disp_map = disp_map_t.detach().cpu().numpy().astype(np.int32)
             peak_sim = peak_sim_t.detach().cpu().numpy().astype(np.float32)
-            entropy  = entropy_t.detach().cpu().numpy().astype(np.float32)
-            top2_gap = top2_gap_t.detach().cpu().numpy().astype(np.float32)  # NEW
+            ent_before_np = entropy_before.detach().cpu().numpy().astype(np.float32)
+            ent_after_np  = entropy_after.detach().cpu().numpy().astype(np.float32)
+            top2_gap = top2_gap_t.detach().cpu().numpy().astype(np.float32)
+            viz_mask_np = viz_mask.detach().cpu().numpy().astype(bool)
 
-            # 7) 패널 저장 (최대 5개 PNG)
-            stem = lp.stem  # 파일이름(확장자 제외)
+            # 7) 패널 저장
+            stem = lp.stem
             save_viz_panels(
                 L_pil, disp_map, peak_sim, args.max_disp,
-                entropy_map=entropy,
+                entropy_map=ent_before_np,         # entropy 패널은 'before'를 그대로
                 ent_vis_thr=args.ent_vis_thr,
                 out_dir=out_dir,
                 stem=stem,
-                top2_gap_map=top2_gap,     # NEW
-                gap_min=args.gap_min       # NEW
+                top2_gap_map=top2_gap,
+                gap_min=1.0,
+                mask_override=viz_mask_np          # 합집합 마스크로 표시
             )
 
             # 8) (옵션) npz 저장
@@ -662,10 +843,12 @@ def main():
                 npz_path = out_dir / "npy" / f"{stem}.npz"
                 np.savez_compressed(
                     npz_path,
-                    disp=disp_map,      # int32
-                    peak_sim=peak_sim,  # float32 (-1..1)
-                    entropy=entropy,    # float32 (0..1)
-                    top2_gap=top2_gap   # float32 (grid units; NaN allowed)
+                    disp=disp_map,                # int32 (refined for viz)
+                    peak_sim=peak_sim,            # float32 (refined for viz)
+                    entropy_before=ent_before_np, # float32 (0..1)
+                    entropy_after=ent_after_np,   # float32 (0..1)
+                    top2_gap=top2_gap,            # float32
+                    viz_mask=viz_mask_np.astype(np.uint8)
                 )
             processed += 1
 

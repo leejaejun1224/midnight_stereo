@@ -527,19 +527,19 @@ def get_args():
     p.add_argument("--width",  type=int, default=1224)
 
     # 모델/디코더
-    p.add_argument("--max_disp_px", type=int, default=64)
+    p.add_argument("--max_disp_px", type=int, default=60)
     p.add_argument("--fused_ch",    type=int, default=320)
-    p.add_argument("--acv_red_ch",  type=int, default=48)
-    p.add_argument("--agg_ch",      type=int, default=32)
+    p.add_argument("--acv_red_ch",  type=int, default=64)
+    p.add_argument("--agg_ch",      type=int, default=64)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
     p.add_argument("--local_radius", type=int, default=8)
 
     # 학습
-    p.add_argument("--epochs",     type=int, default=20)
+    p.add_argument("--epochs",     type=int, default=30)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
-    p.add_argument("--lr",         type=float, default=1e-4)
+    p.add_argument("--lr",         type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--amp",        type=bool, default=True)
     p.add_argument("--seed",       type=int, default=42)
@@ -552,7 +552,7 @@ def get_args():
     p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
     # Full-res 추가
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.01, help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.1, help="Smoothness  @Full-res")
     # photometric 내부 가중(공통)
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
@@ -573,7 +573,7 @@ def get_args():
     # 로깅/저장/재개
     p.add_argument("--log_every",   type=int, default=10)
     p.add_argument("--save_every",  type=int, default=1)
-    p.add_argument("--save_dir",    type=str, default="./log/checkpoints_{current_time}")
+    p.add_argument("--save_dir",    type=str, default=f"./log/checkpoints_{current_time}")
     p.add_argument("--resume",      type=str, default=None)
     p.add_argument("--resume_reset_optim",  action="store_true")
     p.add_argument("--resume_reset_scaler", action="store_true")

@@ -413,4 +413,3 @@ class SOTAStereoDecoder(nn.Module):
         out["disp_1_4"] = disp_q
         return out
 
-

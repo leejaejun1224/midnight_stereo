@@ -165,133 +165,51 @@ def build_interleaved_quarter_features(
     Fq[:, 0::2, 0::2, :] = f44
 
     # L2 정규화 → 내적 == cosine
+    Fq = F.normalize(Fq, dim=-1)
     return Fq  # [B,H/4,W/4,C]
 
 
-# ========== 최소주의 3x3 스택 유틸 ==========
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-
-class Conv3x3GNAct(nn.Module):
-    """3x3 conv -> (GN or BN) -> GELU"""
-    def __init__(self, in_ch, out_ch, stride=1, norm='gn', gn_groups=8):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
-        if norm == 'bn':
-            self.norm = nn.BatchNorm2d(out_ch)
-        elif norm == 'gn':
-            self.norm = nn.GroupNorm(gn_groups, out_ch)
-        else:
-            self.norm = nn.Identity()
-        self.act = nn.GELU()
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-class ResBlock3x3(nn.Module):
-    """(3x3, gn, gelu) x2 + 잔차"""
-    def __init__(self, ch, norm='gn', gn_groups=8):
-        super().__init__()
-        self.conv1 = Conv3x3GNAct(ch, ch, stride=1, norm=norm, gn_groups=gn_groups)
-        # 두 번째는 활성화 직전에 합치기 위해 act 없이 norm만
-        self.conv2_conv = nn.Conv2d(ch, ch, 3, 1, 1, bias=False)
-        if norm == 'bn':
-            self.conv2_norm = nn.BatchNorm2d(ch)
-        elif norm == 'gn':
-            self.conv2_norm = nn.GroupNorm(gn_groups, ch)
-        else:
-            self.conv2_norm = nn.Identity()
-        self.act = nn.GELU()
-    def forward(self, x):
-        y = self.conv1(x)
-        y = self.conv2_norm(self.conv2_conv(y))
-        return self.act(x + y)
-
-# ========== Conv 1/4 분기 (3x3-only) ==========
+# -----------------------------
+# Conv 1/4 분기 & 1/4 융합
+# -----------------------------
 class ConvQuarter(nn.Module):
     """
-    순수 3x3 스택:
-      - 1/2: Conv3x3 s=2 -> (ResBlock3x3)*N_half
-      - 1/4: Conv3x3 s=2 -> (ResBlock3x3)*N_quarter
-    out: [B, cc, H/4, W/4]
+    얕은 Conv stem: 1/2 → 1/4
+    in:  [B,3,H,W]
+    out: [B,Cc,H/4,W/4]
     """
-    def __init__(
-        self,
-        in_ch: int = 3,
-        cc: int = 256,          # 출력 채널 (기본 256)
-        norm: str = 'gn',
-        gn_groups: int = 8,
-        c_half: int = 128,      # H/2 단계 채널
-        n_blocks_half: int = 2, # 1/2 스케일 블록 수
-        n_blocks_quarter: int = 3, # 1/4 스케일 블록 수
-    ):
+    def __init__(self, in_ch: int = 3, cc: int = 192, gn_groups: int = 8):
         super().__init__()
-        # H/2
-        self.s2 = Conv3x3GNAct(in_ch, c_half, stride=2, norm=norm, gn_groups=gn_groups)
-        self.stage_half = nn.Sequential(*[
-            ResBlock3x3(c_half, norm=norm, gn_groups=gn_groups)
-            for _ in range(n_blocks_half)
-        ])
-        # H/4
-        self.s4 = Conv3x3GNAct(c_half, cc, stride=2, norm=norm, gn_groups=gn_groups)
-        self.stage_quarter = nn.Sequential(*[
-            ResBlock3x3(cc, norm=norm, gn_groups=gn_groups)
-            for _ in range(n_blocks_quarter)
-        ])
+        self.conv14 = nn.Sequential(
+            nn.Conv2d(in_ch, 96, 3, 2, 1),
+            nn.GroupNorm(gn_groups, 96),
+            nn.GELU(),
+            nn.Conv2d(96, cc, 3, 2, 1),
+            nn.GroupNorm(gn_groups, cc),
+            nn.GELU(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.s2(x)            # [B,c_half,H/2,W/2]
-        x = self.stage_half(x)
-        x = self.s4(x)            # [B,cc,H/4,W/4]
-        x = self.stage_quarter(x) # [B,cc,H/4,W/4]
-        return x
+        return self.conv14(x)
 
-# ========== Fusion 1/4 (3x3-only) ==========
+
 class Fusion1_4(nn.Module):
     """
-    1/4에서 Conv분기(cc)와 ViT분기(cv)를 concat 후,
-    3x3-only 네트로 Cf로 축소·융합.
-    - 첫 forward 때 v8_up 채널을 읽어 in_conv를 동적 생성(런타임 적응)
+    1/4 스케일에서 Conv(1/4)와 ViT(1/8 업샘플)를 융합.
+    in:  [B, Cc+Cv, H/4, W/4]
+    out: [B, Cf,   H/4, W/4]
     """
-    def __init__(
-        self,
-        cc: int = 256,
-        cv: int = 0,           # 무시(런타임에서 자동 적응)
-        cf: int = 320,         # 최종 융합 출력 채널 (디코더 fused_in_ch와 일치)
-        norm: str = 'gn',
-        gn_groups: int = 8,
-        n_blocks: int = 2,     # 융합 후 ResBlock 개수
-    ):
+    def __init__(self, cc: int = 192, cv: int = 384, cf: int = 256):
         super().__init__()
-        self.cc = cc
-        self.cf = cf
-        self.norm = norm
-        self.gn_groups = gn_groups
-        self.n_blocks = n_blocks
-
-        self.in_conv: Optional[nn.Module] = None  # 첫 forward에서 생성
-        self.blocks: Optional[nn.Sequential] = None
-
-    def _build_once(self, in_ch_total: int, device: torch.device):
-        # 입력(cat) -> cf 로 바로 축소 (3x3)
-        self.in_conv = Conv3x3GNAct(
-            in_ch_total, self.cf, stride=1, norm=self.norm, gn_groups=self.gn_groups
-        ).to(device)
-        # 융합 후 3x3 잔차 블록들
-        self.blocks = nn.Sequential(*[
-            ResBlock3x3(self.cf, norm=self.norm, gn_groups=self.gn_groups)
-            for _ in range(self.n_blocks)
-        ]).to(device)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(cc + cv, cf, 1),
+            nn.GELU(),
+            nn.Conv2d(cf, cf, 3, 1, 1),
+        )
 
     def forward(self, c4: torch.Tensor, v8_up: torch.Tensor) -> torch.Tensor:
-        if self.in_conv is None:
-            in_ch_total = c4.shape[1] + v8_up.shape[1]
-            self._build_once(in_ch_total, c4.device)
         x = torch.cat([c4, v8_up], dim=1)
-        x = self.in_conv(x)
-        x = self.blocks(x)
-        return x
+        return self.fuse(x)
 
 
 # -----------------------------
@@ -391,7 +309,7 @@ class StereoModel(nn.Module):
         amp: bool = True,
         cc: int = 192,
         cv: int = 384+384,
-        cf: int = 256,
+        cf: int = 320,
         autopad_to_8: bool = True,
         pad_mode_for_interleave: str = "replicate",
         vit_model: Optional[nn.Module] = None,
@@ -410,8 +328,8 @@ class StereoModel(nn.Module):
                 p.requires_grad = False
 
         # Conv 1/4 & Fusion
-        self.conv14 = ConvQuarter(in_ch=3, cc=256)
-        self.fuse14 = Fusion1_4(cc=256, cf=320) 
+        self.conv14 = ConvQuarter(in_ch=3, cc=cc)
+        self.fuse14 = Fusion1_4(cc=cc, cv=cv, cf=cf)
 
         self.to(self.device)
 
@@ -432,17 +350,13 @@ class StereoModel(nn.Module):
         H, W = Hpad - pad_b, Wpad - pad_r
 
         # 2) CosSim 전용 1/4 피처 (인터리빙, L2 normalized)
+        #    - 비학습(no_grad), AMP, 4시프트 순차 실행
         with torch.no_grad():
             Fq = build_interleaved_quarter_features(
                 self.vit, img, pad_mode=self.pad_mode_for_interleave, amp=self.amp
             )  # [B,H/4,W/4,C]
-        # 언패드
-        Fqn = F.normalize(Fq, dim=-1)
-        
-        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)        # [B,h4,w4,C]
-        Fqn = unpad_1_4_lastdim(Fqn, pad_b, pad_r)        # [B,h4,w4,C]
-        # 코스트 볼륨용 NCHW 버전 추가
-        Fq_cf = Fq.permute(0, 3, 1, 2).contiguous()     # [B,C,h4,w4]
+        # 언패드 반영
+        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)  # [B,h4,w4,C]
 
         # 3) ViT 1/8 토큰 (학습/동결 옵션)
         tokens_hw = extract_vit_1_8_tokens(
@@ -460,11 +374,10 @@ class StereoModel(nn.Module):
         F4 = self.fuse14(C4, V8_up)                                                          # [B,Cf,H/4,W/4]
 
         return {
-            "fused_1_4":         F4,      # 다운스트림용
-            "cossim_feat_1_4":   Fq,      # L2 normalized, 채널-마지막 [B,H/4,W/4,C]
-            "vit_interleaved_1_4": Fq_cf, # L2 normalized, 채널-우선   [B,C,H/4,W/4]  <-- 추가된 부분
-            "vit_1_8":           V8,      # 필요시 사용
-            "conv_1_4":          C4,      # 필요시 사용
+            "fused_1_4":       F4,   # 다운스트림용
+            "cossim_feat_1_4": Fq,   # L2 normalized, cos 전용 (채널 마지막)
+            "vit_1_8":         V8,   # 필요시 사용
+            "conv_1_4":        C4,   # 필요시 사용
         }
 
     # ---- 스테레오 입력 (좌/우) ----
