@@ -16,12 +16,12 @@ from logger import save_args_as_text
 from vit_cn import StereoModel
 from agg.aggregator import SOTAStereoDecoder
 from agg.decoder_selective_igev import IGEVStereo
+from logger import save_args_txt_dynamic
 
 from tools import (
     set_seed,
     StereoFolderDataset,
     denorm_imagenet,
-    PhotometricLoss,
     warp_right_to_left_image,
     get_disparity_smooth_loss,
     # --- 실시간 평가 ---
@@ -31,6 +31,7 @@ from tools import (
     compute_depth_metrics,
     compute_bin_weighted_depth,
     disparity_to_depth,
+    PhotometricLoss
 )
 from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
@@ -38,6 +39,7 @@ from losses import (
     AdaptiveWindowDistillLoss,
     # PhotometricLoss,
 )
+torch.backends.cudnn.benchmark = True
 
 # (선택) 체크포인트 유틸
 try:
@@ -246,6 +248,10 @@ def train(args):
     if args.realtime_test:
         print(f"[Calib] fx(px)={getattr(args,'focal_px',0.0):.6f}  baseline(m)={getattr(args,'baseline_m',0.0):.6f}  src={src}")
 
+    os.makedirs(args.save_dir, exist_ok=True)
+    args_txt = save_args_txt_dynamic(args, save_dir=args.save_dir, filename="args.txt")
+    print(f"[Args] Saved to {args_txt}")
+
     # --- 데이터셋/로더 ---
     dataset = StereoFolderDataset(args.left_dir, args.right_dir,
                                   height=args.height, width=args.width)
@@ -260,17 +266,17 @@ def train(args):
         autopad_to_8=False,   # << 입력은 외부에서 16배수 패딩
     ).to(device).train()
 
-    decoder = SOTAStereoDecoder(
-        max_disp_px=args.max_disp_px,
-        fused_in_ch=args.fused_ch,
-        red_ch=args.acv_red_ch,
-        base3d=args.agg_ch,
-        use_motif=args.use_motif,
-        two_stage=args.two_stage,
-        local_radius_cells=args.local_radius
-    ).to(device).train()
+    # decoder = SOTAStereoDecoder(
+    #     max_disp_px=args.max_disp_px,
+    #     fused_in_ch=args.fused_ch,
+    #     red_ch=args.acv_red_ch,
+    #     base3d=args.agg_ch,
+    #     use_motif=args.use_motif,
+    #     two_stage=args.two_stage,
+    #     local_radius_cells=args.local_radius
+    # ).to(device).train()
 
-    # decoder = IGEVStereo(args)
+    decoder = IGEVStereo(args).to(device).train()
 
     ckpt_model = torch.nn.ModuleDict({
         "stereo": stereo,
@@ -316,7 +322,7 @@ def train(args):
     params = list(stereo.parameters()) + list(decoder.parameters())
     params = [p for p in params if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    # scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     # --- 체크포인트 재개 ---
     start_epoch = 1
@@ -328,11 +334,11 @@ def train(args):
                 print("[Resume] optimizer 상태 복구")
             except Exception as e:
                 print(f"[Resume] optimizer 복구 실패 → 초기화: {e}")
-        if (ckpt is not None) and ("scaler" in ckpt) and (ckpt["scaler"] is not None) and (not args.resume_reset_scaler):
-            try:
-                scaler.load_state_dict(ckpt["scaler"]); print("[Resume] GradScaler 상태 복구")
-            except Exception as e:
-                print(f"[Resume] GradScaler 상태 복구 실패 → 무시: {e}")
+        # if (ckpt is not None) and ("scaler" in ckpt) and (ckpt["scaler"] is not None) and (not args.resume_reset_scaler):
+        #     try:
+        #         scaler.load_state_dict(ckpt["scaler"]); print("[Resume] GradScaler 상태 복구")
+        #     except Exception as e:
+        #         print(f"[Resume] GradScaler 상태 복구 실패 → 무시: {e}")
 
     # --- RealtimeEvalLogger ---
     os.makedirs(args.save_dir, exist_ok=True)
@@ -354,8 +360,8 @@ def train(args):
                 imgR_01 = denorm_imagenet(imgR)
 
             # === 1) 입력 16배수 패딩 ===
-            imgL_pad, pad = pad_to_multiple(imgL,  mult=16, mode="replicate")
-            imgR_pad, _   = pad_to_multiple(imgR,  mult=16, mode="replicate")
+            imgL_pad, pad = pad_to_multiple(imgL,  mult=32, mode="replicate")
+            imgR_pad, _   = pad_to_multiple(imgR,  mult=32, mode="replicate")
 
             # pad = (pad_b, pad_r) 이고, 16배수라서 pad_b%4==0, pad_r%4==0 이 보장됨
             assert pad[0] % 4 == 0 and pad[1] % 4 == 0, "pad must be divisible by 4"
@@ -363,7 +369,11 @@ def train(args):
             with torch.cuda.amp.autocast(enabled=args.amp):
                 # 2) 백본/디코더 실행
                 bb_out = stereo(imgL_pad, imgR_pad)
-                pred   = decoder(bb_out)
+                # for sota 어쩌고
+                # pred   = decoder(bb_out)
+                
+                # 이건 igev 디코더용
+                pred   = decoder(imgL_pad, imgR_pad, bb_out["left"]["fused_1_4"], bb_out["right"]["fused_1_4"], iters=args.igev_iters)
 
                 # 3) 출력 언패드 — 모두 1/4 해상도 좌표계(+Full-res)
                 pad_q = (pad[0] // 4, pad[1] // 4)
@@ -422,8 +432,8 @@ def train(args):
                 photo_map_full  = photo_crit.simple_photometric_loss(imgL_01, imgR_full_warp, weights=[args.photo_l1_w, args.photo_ssim_w])
                 loss_photo_full = (photo_map_full * valid_full).sum() / (valid_full.sum() + 1e-6)
                 loss_photo_full = loss_photo_full * args.w_photo_fullres
-                logits = unpad_last2(pred["logits_1_4"], pad_q)
-                distillloss, info = criterion(FqL, FqR, logits, return_debug=True)
+                # logits = unpad_last2(pred["logits_1_4"], pad_q)
+                # distillloss, info = criterion(FqL, FqR, logits, return_debug=True)
                 
                 # Smoothness @Full-res
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
@@ -433,13 +443,16 @@ def train(args):
                     loss_dir
                     + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
                 )
-                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full + distillloss*args.w_distill
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full # distillloss*args.w_distill
 
             # 최적화
             optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-            scaler.step(optim); scaler.update()
+            loss.backward()
+            optim.step()
+            # scaler.scale(loss).backward()
+
+            # torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
+            # scaler.step(optim); scaler.update()
             running += float(loss.item())
 
             # --- 실시간 정량평가 ---
@@ -519,7 +532,7 @@ def train(args):
             if HAS_CKPT:
                 save_checkpoint(
                     ckpt_path, epoch,
-                    ckpt_model, optim, scaler, args
+                    ckpt_model, optim, args
                 )
             else:
                 torch.save({
@@ -527,7 +540,6 @@ def train(args):
                     "stereo": stereo.state_dict(),
                     "decoder": decoder.state_dict(),
                     "optim": optim.state_dict(),
-                    "scaler": scaler.state_dict() if args.amp else None,
                     "args": vars(args)
                 }, ckpt_path)
             print(f"[Save] {ckpt_path}")
@@ -565,7 +577,7 @@ def get_args():
     p.add_argument("--corr_levels",type=int, default=4)
     p.add_argument("--mixed_precision",type=bool, default=True)
     p.add_argument("--precision_dtype",type=str, default="float16")
-    p.add_argument("--valid_iters",type=int, default=32)
+    p.add_argument("--igev_iters",type=int, default=16)
     
     # 학습
     p.add_argument("--epochs",     type=int, default=10)
@@ -573,7 +585,7 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--amp",        type=bool, default=True)
+    p.add_argument("--amp",        type=bool, default=False)
     p.add_argument("--seed",       type=int, default=42)
 
     # 손실 가중치

@@ -3,6 +3,52 @@ import os
 from datetime import datetime
 from typing import Dict, Any
 
+def save_args_txt_dynamic(args, save_dir: str, filename: str = "args.txt") -> str:
+    """
+    - args의 모든 키를 동적으로 저장합니다(섹션 없음).
+    - 헤더/구분선/정렬은 질문에서 주신 포맷을 그대로 따릅니다.
+    - 기존 파일이 있으면 타임스탬프가 붙은 새 파일 이름으로 저장합니다.
+    - bool은 True/False, None은 'None', float은 지수 표기 없이 깔끔히 출력합니다.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 타임스탬프 (KST)
+    ts = datetime.now(tz=timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # 파일 경로 (중복 시 타임스탬프 파일명)
+    path = os.path.join(save_dir, filename)
+    if os.path.exists(path):
+        ts_name = datetime.now(tz=timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime("%y%m%d_%H%M%S")
+        base, ext = os.path.splitext(filename)
+        path = os.path.join(save_dir, f"{base}_{ts_name}{ext}")
+
+    # 값 포맷터
+    def _fmt(v):
+        if isinstance(v, bool):
+            return "True" if v else "False"
+        if v is None:
+            return "None"
+        if isinstance(v, float):
+            s = f"{v:.12f}".rstrip("0").rstrip(".")
+            if s == "-0": s = "0"
+            return s
+        return str(v)
+
+    kv = vars(args)
+    keys = sorted(kv.keys())
+    width = max(8, max(len(k) for k in keys)) if keys else 8
+
+    sep = "=" * 80
+    lines = [sep, f"Stereo Training Arguments — {ts}", sep, ""]
+    for k in keys:
+        lines.append(f"{k.ljust(width)} : {_fmt(kv[k])}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
 
 def _stringify(v: Any) -> str:
     """값을 보기 좋게 문자열로 변환"""

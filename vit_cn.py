@@ -28,7 +28,7 @@ def load_dino_vits8(device: torch.device, eval_mode: bool = True):
     err_msgs = []
     # 1) torch.hub (공식)
     try:
-        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
+        model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
     except Exception as e:
         err_msgs.append(f"torch.hub dino_vits8 load failed: {e}")
 
@@ -308,7 +308,7 @@ class StereoModel(nn.Module):
         freeze_vit: bool = True,
         amp: bool = True,
         cc: int = 192,
-        cv: int = 384+384,
+        cv: int = 384,
         cf: int = 320,
         autopad_to_8: bool = True,
         pad_mode_for_interleave: str = "replicate",
@@ -376,8 +376,8 @@ class StereoModel(nn.Module):
         return {
             "fused_1_4":       F4,   # 다운스트림용
             "cossim_feat_1_4": Fq,   # L2 normalized, cos 전용 (채널 마지막)
-            "vit_1_8":         V8,   # 필요시 사용
             "conv_1_4":        C4,   # 필요시 사용
+            "vit_1_8":         V8,   # 필요시 사용
         }
 
     # ---- 스테레오 입력 (좌/우) ----

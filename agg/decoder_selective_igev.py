@@ -211,8 +211,9 @@ def build_concat_volume(refimg_fea, targetimg_fea, maxdisp):
     return volume
 
 def disparity_regression(x, maxdisp):
+
     assert len(x.shape) == 4
-    disp_values = torch.arange(0, maxdisp, dtype=x.dtype, device=x.device).view(1, maxdisp, 1, 1)
+    disp_values = torch.arange(0, maxdisp+1, dtype=x.dtype, device=x.device).view(1, maxdisp+1, 1, 1)
     return torch.sum(x * disp_values, 1, keepdim=True)
 
 class FeatureAtt(nn.Module):
@@ -649,13 +650,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 # update / extractor / geometry / submodule symbols already in ns
 
-try:
-    autocast = torch.cuda.amp.autocast
-except:
-    class autocast:
-        def __init__(self, enabled): pass
-        def __enter__(self): pass
-        def __exit__(self, *args): pass
+# try:
+#     autocast = torch.cuda.amp.autocast
+# except:
+#     class autocast:
+#         def __init__(self, enabled): pass
+#         def __enter__(self): pass
+#         def __exit__(self, *args): pass
 
 class hourglass(nn.Module):
     def __init__(self, in_channels):
@@ -708,7 +709,7 @@ class IGEVStereo(nn.Module):
         context_dims = args.hidden_dims
 
         # context encoder & GRU update
-        self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn="batch", downsample=args.n_downsample)
+        self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn="group", downsample=args.n_downsample)
         self.update_block = BasicSelectiveMultiUpdateBlock(self.args, hidden_dims=args.hidden_dims)
         self.sam = SpatialAttentionExtractor()
         self.cam = ChannelAttentionEnhancement(128)
@@ -748,7 +749,7 @@ class IGEVStereo(nn.Module):
 
         # === (NEW) ViT 1/4 feature adapter ===
         # args.vit_ch_1_4: ViT 1/4 feature channel count (e.g., 256/320)
-        vitc = getattr(args, 'vit_ch_1_4', None)
+        vitc = getattr(args, 'fused_ch', None)
         if vitc is not None:
             # 1/4 레벨: ViT( Cvit ) → 48ch 로 project 후 stem_4x(48)와 concat → 96ch
             self.vit_proj_1_4_to48 = nn.Conv2d(vitc, 48, 1, bias=False)
@@ -763,10 +764,10 @@ class IGEVStereo(nn.Module):
                 m.eval()
 
     def upsample_disp(self, disp, mask_feat_4, stem_2x):
-        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
-            xspx = self.spx_2_gru(mask_feat_4, stem_2x)
-            spx_pred = self.spx_gru(xspx); spx_pred = F.softmax(spx_pred, 1)
-            up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
+        # with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+        xspx = self.spx_2_gru(mask_feat_4, stem_2x)
+        spx_pred = self.spx_gru(xspx); spx_pred = F.softmax(spx_pred, 1)
+        up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
         return up_disp
 
     def _build_feats_from_vit(self, vit_1_4, stem_4x):
@@ -790,58 +791,58 @@ class IGEVStereo(nn.Module):
             disp_1_4_px: [B,1,H/4,W/4], disparity values in **pixels** (cell*4)
             disp_full  : [B,1,H,  W  ], full-resolution disparity in pixels
         """
-        image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
-        image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
+        # image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
+        # image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
 
         use_vit = (vit_left_1_4 is not None) and (vit_right_1_4 is not None) 
 
-        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
-            # stems (이미지 기반 경량 특징, 기존과 동일)
-            stem_2x = self.stem_2(image1)
-            stem_4x = self.stem_4(stem_2x)
-            stem_2y = self.stem_2(image2)
-            stem_4y = self.stem_4(stem_2y)
+        # with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+        # stems (이미지 기반 경량 특징, 기존과 동일)
+        stem_2x = self.stem_2(image1)
+        stem_4x = self.stem_4(stem_2x)
+        stem_2y = self.stem_2(image2)
+        stem_4y = self.stem_4(stem_2y)
 
-            # 멀티스케일 features 준비
-            if use_vit:
-                # ViT 경로: 외부 1/4 피처를 피라미드로 어댑팅
-                features_left  = self._build_feats_from_vit (vit_left_1_4,  stem_4x)   # [x4(96), x8(64), x16(192), x32(160)]
-                features_right = self._build_feats_from_vit (vit_right_1_4, stem_4y)
-            # else:
-            #     # 기존 Feature() 경로 (MobileNetV2)
-            #     features_left  = self.feature(image1)
-            #     features_right = self.feature(image2)
-            #     # 1/4에서 stem_4x를 붙여 96ch로 (기존 코드 유지)
-            #     features_left[0]  = torch.cat((features_left[0],  stem_4x), 1)
-            #     features_right[0] = torch.cat((features_right[0], stem_4y), 1)
+        # 멀티스케일 features 준비
+        if use_vit:
+            # ViT 경로: 외부 1/4 피처를 피라미드로 어댑팅
+            features_left  = self._build_feats_from_vit (vit_left_1_4,  stem_4x)   # [x4(96), x8(64), x16(192), x32(160)]
+            features_right = self._build_feats_from_vit (vit_right_1_4, stem_4y)
+        # else:
+        #     # 기존 Feature() 경로 (MobileNetV2)
+        #     features_left  = self.feature(image1)
+        #     features_right = self.feature(image2)
+        #     # 1/4에서 stem_4x를 붙여 96ch로 (기존 코드 유지)
+        #     features_left[0]  = torch.cat((features_left[0],  stem_4x), 1)
+        #     features_right[0] = torch.cat((features_right[0], stem_4y), 1)
 
-            # 매칭용 1/4 특징(96ch) -> 96ch desc
-            match_left  = self.desc(self.conv(features_left[0]))
-            match_right = self.desc(self.conv(features_right[0]))
+        # 매칭용 1/4 특징(96ch) -> 96ch desc
+        match_left  = self.desc(self.conv(features_left[0]))
+        match_right = self.desc(self.conv(features_right[0]))
 
-            # GWC cost volume (1/4)
-            gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp//4, 8)
-            gwc_volume = self.corr_stem(gwc_volume)
-            gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
-            geo_encoding_volume = self.cost_agg(gwc_volume, features_left)
+        # GWC cost volume (1/4)
+        gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp_px//4, 8)
+        gwc_volume = self.corr_stem(gwc_volume)
+        gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
+        geo_encoding_volume = self.cost_agg(gwc_volume, features_left)
 
-            # Stage-0: 초기 disp (1/4 cell 단위)
-            prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
-            disp = disparity_regression(prob, self.args.max_disp//4)  # [B,1,H/4,W/4] in cell units
-            del prob, gwc_volume
+        # Stage-0: 초기 disp (1/4 cell 단위)
+        prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
+        disp = disparity_regression(prob, self.args.max_disp_px//4)  # [B,1,H/4,W/4] in cell units
+        del prob, gwc_volume
 
-            # spx mask (train/eval 동일하게 계산해 사용)
-            xspx = self.spx_4(features_left[0])
-            xspx = self.spx_2(xspx, stem_2x)
-            spx_pred = self.spx(xspx)
-            spx_pred = F.softmax(spx_pred, 1)
+        # spx mask (train/eval 동일하게 계산해 사용)
+        xspx = self.spx_4(features_left[0])
+        xspx = self.spx_2(xspx, stem_2x)
+        spx_pred = self.spx(xspx)
+        spx_pred = F.softmax(spx_pred, 1)
 
-            # context encoder for GRU
-            cnet_list = self.cnet(image1, num_layers=self.args.n_gru_layers)
-            net_list = [torch.tanh(x[0]) for x in cnet_list]
-            inp_list = [torch.relu(x[1]) for x in cnet_list]
-            inp_list = [self.cam(x) * x for x in inp_list]
-            att = [self.sam(x) for x in inp_list]
+        # context encoder for GRU
+        cnet_list = self.cnet(image1, num_layers=self.args.n_gru_layers)
+        net_list = [torch.tanh(x[0]) for x in cnet_list]
+        inp_list = [torch.relu(x[1]) for x in cnet_list]
+        inp_list = [self.cam(x) * x for x in inp_list]
+        att = [self.sam(x) for x in inp_list]
 
         # Combined Geo Encoding Volume function
         geo_block = Combined_Geo_Encoding_Volume
@@ -854,8 +855,8 @@ class IGEVStereo(nn.Module):
         for itr in range(iters):
             disp = disp.detach()
             geo_feat = geo_fn(disp, coords)
-            with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
-                net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, att)
+            # with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+            net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, att)
             disp = disp + delta_disp
 
         # 최종 출력들
@@ -866,6 +867,9 @@ class IGEVStereo(nn.Module):
         disp_full = self.upsample_disp(disp, mask_feat_4, stem_2x)
 
         # (참고) 초기 full-res도 원하면: init_full = context_upsample(init_disp*4., spx_pred.float()).unsqueeze(1)
-
-        return disp_1_4_px, disp_full
+        pred = {
+            'disp_1_4': disp_1_4_px,
+            'disp_full': disp_full,
+        }
+        return pred
 # ===== END core/igev_stereo.py =====
