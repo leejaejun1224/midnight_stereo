@@ -21,6 +21,7 @@ from tools import (
     set_seed,
     StereoFolderDataset,
     denorm_imagenet,
+    PhotometricLoss,
     warp_right_to_left_image,
     get_disparity_smooth_loss,
     # --- 실시간 평가 ---
@@ -35,7 +36,7 @@ from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
     FeatureReprojLoss,
     AdaptiveWindowDistillLoss,
-    PhotometricLoss,
+    # PhotometricLoss,
 )
 
 # (선택) 체크포인트 유틸
@@ -308,7 +309,8 @@ def train(args):
             print(f"[Warn] FeatureReprojLoss unavailable ({e}) → w_reproj=0으로 강등")
             w_reproj = 0.0
 
-    photo_crit = PhotometricLoss(w_l1 = args.photo_l1_w, w_ssim=args.photo_ssim_w)
+    # photo_crit = PhotometricLoss(w_l1 = args.photo_l1_w, w_ssim=args.photo_ssim_w)
+    photo_crit = PhotometricLoss([args.photo_l1_w, args.photo_ssim_w])
 
     # --- 옵티마/스케일러 ---
     params = list(stereo.parameters()) + list(decoder.parameters())
