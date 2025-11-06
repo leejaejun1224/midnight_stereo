@@ -9,19 +9,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
+from logger import save_args_as_text
 # =========================
 # (환경에 맞게 경로 조정)
 # =========================
 from vit_cn import StereoModel
 from agg.aggregator import SOTAStereoDecoder
+from agg.decoder_selective_igev import IGEVStereo
 
 from tools import (
     set_seed,
     StereoFolderDataset,
     denorm_imagenet,
     warp_right_to_left_image,
-    PhotometricLoss,
     get_disparity_smooth_loss,
     # --- 실시간 평가 ---
     read_fx_baseline_rgb,
@@ -33,7 +33,9 @@ from tools import (
 )
 from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
-    FeatureReprojLoss
+    FeatureReprojLoss,
+    AdaptiveWindowDistillLoss,
+    PhotometricLoss,
 )
 
 # (선택) 체크포인트 유틸
@@ -267,6 +269,8 @@ def train(args):
         local_radius_cells=args.local_radius
     ).to(device).train()
 
+    # decoder = IGEVStereo(args)
+
     ckpt_model = torch.nn.ModuleDict({
         "stereo": stereo,
         "decoder": decoder,
@@ -283,7 +287,17 @@ def train(args):
         lambda_v=args.lambda_v, lambda_h=args.lambda_h,
         huber_delta=args.huber_delta_h
     ).to(device)
-
+    criterion = AdaptiveWindowDistillLoss(
+            max_disp=args.max_disp_px / 4.0,
+            roi_mode="frac", roi_u0=0.3, roi_u1=7.0, roi_v0=0.7, roi_v1=1.0,
+            ent_T=0.1, ent_vis_thr=0.6, train_ent_thr=None,  # after-entropy gating off
+            max_half=12, T_teacher=0.1, T_student=1.0,
+            lambda_kl=1.0, lambda_reg=0.5,
+            use_peak_weight=True, weight_alpha=1.0, weight_beta=1.0,
+            weight_gamma=0.5, weight_delta=1.0,
+            gap_min=1.0, gap_norm=4.0, L0=8.0
+        ).to(device)
+    
     # (선택) Feature reprojection loss — args.w_reproj 있을 때만 켜기
     w_reproj = float(getattr(args, "w_reproj", 0.0))
     reprog_loss_fn = None
@@ -294,7 +308,7 @@ def train(args):
             print(f"[Warn] FeatureReprojLoss unavailable ({e}) → w_reproj=0으로 강등")
             w_reproj = 0.0
 
-    photo_crit = PhotometricLoss(weights=[args.photo_l1_w, args.photo_ssim_w])
+    photo_crit = PhotometricLoss(w_l1 = args.photo_l1_w, w_ssim=args.photo_ssim_w)
 
     # --- 옵티마/스케일러 ---
     params = list(stereo.parameters()) + list(decoder.parameters())
@@ -366,6 +380,10 @@ def train(args):
                 feat_L = unpad_last2(bb_out["left"]["fused_1_4"],  pad_q)  # [B,C,Hq,Wq]
                 feat_R = unpad_last2(bb_out["right"]["fused_1_4"], pad_q)  # [B,C,Hq,Wq]
 
+                FqL = CS_1_4
+                FqR_padded = bb_out["right"]["cossim_feat_1_4"]  # [B,Hq_pad,Wq_pad,C] (BHWC)
+                FqR        = unpad_bhwc(FqR_padded, pad_q)
+
                 # (d) full-res disparity(px) — 디코더 제공 or 업샘플 fallback
                 if "disp_full" in pred:
                     disp_full_px_padded = pred["disp_full"]                # [B,1,H_pad,W_pad]
@@ -402,7 +420,9 @@ def train(args):
                 photo_map_full  = photo_crit.simple_photometric_loss(imgL_01, imgR_full_warp, weights=[args.photo_l1_w, args.photo_ssim_w])
                 loss_photo_full = (photo_map_full * valid_full).sum() / (valid_full.sum() + 1e-6)
                 loss_photo_full = loss_photo_full * args.w_photo_fullres
-
+                logits = unpad_last2(pred["logits_1_4"], pad_q)
+                distillloss, info = criterion(FqL, FqR, logits, return_debug=True)
+                
                 # Smoothness @Full-res
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
 
@@ -411,7 +431,7 @@ def train(args):
                     loss_dir
                     + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
                 )
-                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full + distillloss*args.w_distill
 
             # 최적화
             optim.zero_grad(set_to_none=True)
@@ -441,8 +461,8 @@ def train(args):
                         has_fb = (getattr(args, "focal_px", 0.0) > 0.0) and (getattr(args, "baseline_m", 0.0) > 0.0)
                         if has_fb:
                             # --- Disparity metrics (px 기준) ---
-                            gt_disp_q_px   = (args.focal_px * args.baseline_m) / gt_depth_q.clamp_min(1e-6)  # px
-                            pred_disp_q_px = disp_q_px                                                             # px
+                            gt_disp_q_px   = (args.focal_px * args.baseline_m) / gt_depth_q.clamp_min(1e-6) / 4.0  # px
+                            pred_disp_q_px = disp_q_px  / 4.0                                                     # px
                             disp_metrics   = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid_mask)
 
                             # --- Depth metrics (@1/4 격자) ---
@@ -529,17 +549,27 @@ def get_args():
     # 모델/디코더
     p.add_argument("--max_disp_px", type=int, default=60)
     p.add_argument("--fused_ch",    type=int, default=320)
-    p.add_argument("--acv_red_ch",  type=int, default=64)
+    p.add_argument("--acv_red_ch",  type=int, default=96)
     p.add_argument("--agg_ch",      type=int, default=64)
     p.add_argument("--use_motif",   type=bool, default=True)
-    p.add_argument("--two_stage",   type=bool, default=True)
+    p.add_argument("--two_stage",   type=bool, default=False)
     p.add_argument("--local_radius", type=int, default=8)
-
+    
+    
+    p.add_argument("--hidden_dims", default=[128, 128, 128])
+    p.add_argument("--n_downsample", type=int, default=2)
+    p.add_argument("--n_gru_layers", type=int, default=3)
+    p.add_argument("--corr_radius",type=int, default=4)
+    p.add_argument("--corr_levels",type=int, default=4)
+    p.add_argument("--mixed_precision",type=bool, default=True)
+    p.add_argument("--precision_dtype",type=str, default="float16")
+    p.add_argument("--valid_iters",type=int, default=32)
+    
     # 학습
-    p.add_argument("--epochs",     type=int, default=30)
+    p.add_argument("--epochs",     type=int, default=10)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
-    p.add_argument("--lr",         type=float, default=5e-5)
+    p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--amp",        type=bool, default=True)
     p.add_argument("--seed",       type=int, default=42)
@@ -547,25 +577,27 @@ def get_args():
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
     p.add_argument("--w_reproj",           type=float, default=1.0)
+    p.add_argument("--w_distill",           type=float, default=0.5)
     # 1/4 해상도
     p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
     # Full-res 추가
-    p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.1, help="Smoothness  @Full-res")
+    p.add_argument("--w_photo_fullres",    type=float, default=0.0,   help="Photometric @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.0, help="Smoothness  @Full-res")
     # photometric 내부 가중(공통)
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
+    
 
     # DirectionalRelScaleDispLoss 하이퍼 (cossim + 세로 [-1,0]/[0,1])
-    p.add_argument("--sim_thr",      type=float, default=0.75)
+    p.add_argument("--sim_thr",      type=float, default=0.8)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=0.4)
-    p.add_argument("--vert_down_allow", type=float, default=0.4)
-    p.add_argument("--horiz_margin",    type=float, default=0.1)
+    p.add_argument("--vert_up_allow",   type=float, default=1.0)
+    p.add_argument("--vert_down_allow", type=float, default=1.0)
+    p.add_argument("--horiz_margin",    type=float, default=0.0)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
     p.add_argument("--huber_delta_h", type=float, default=1.0)
@@ -596,4 +628,5 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
+    # save_args_as_text(args, args.save_dir)
     train(args)

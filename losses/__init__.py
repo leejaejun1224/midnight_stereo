@@ -8,6 +8,7 @@ from .prob_consistency import NeighborProbConsistencyLoss
 from .entropy import EntropySharpnessLoss
 from .seed_anchor import SeedAnchorHuberLoss
 from .sky import SkyGridZeroLoss
+from .windowdistill import AdaptiveWindowDistillLoss
 
 __all__ = [
     "SSIM", "PhotometricLoss",
@@ -20,4 +21,5 @@ __all__ = [
     "EntropySharpnessLoss",
     "SeedAnchorHuberLoss",
     "SkyGridZeroLoss",
+    "AdaptiveWindowDistillLoss"
 ]

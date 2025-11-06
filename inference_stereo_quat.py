@@ -481,10 +481,10 @@ def run_inference(args):
 
                 # disparity full-res(px)
                 if args.save_color:
-                    p1 = os.path.join(out_vis, f"{stem}_disp_full_px.png")
-                    save_colormap_png(p1, disp_full_px_np, vmax=args.vmax)
-                    if text_overlay:
-                        annotate_png_top_left(p1, text_overlay)
+                    # p1 = os.path.join(out_vis, f"{stem}_disp_full_px.png")
+                    # save_colormap_png(p1, disp_full_px_np, vmax=args.vmax)
+                    # if text_overlay:
+                    #     annotate_png_top_left(p1, text_overlay)
 
                     # 1/4 해상도(px) 보조 시각화
                     p2 = os.path.join(out_vis, f"{stem}_disp_1_4_px.png")
@@ -493,12 +493,12 @@ def run_inference(args):
                         annotate_png_top_left(p2, text_overlay)
 
                     # 깊이(m) 시각화(선택)
-                    if depth_m_np is not None:
-                        vmax_depth = args.vmax_depth if (args.vmax_depth is not None and args.vmax_depth > 0) else None
-                        p3 = os.path.join(out_vis, f"{stem}_depth_m.png")
-                        save_colormap_png(p3, depth_m_np, vmax=vmax_depth, cmap_name="viridis")
-                        if text_overlay:
-                            annotate_png_top_left(p3, text_overlay)
+                    # if depth_m_np is not None:
+                    #     vmax_depth = args.vmax_depth if (args.vmax_depth is not None and args.vmax_depth > 0) else None
+                    #     p3 = os.path.join(out_vis, f"{stem}_depth_m.png")
+                    #     save_colormap_png(p3, depth_m_np, vmax=vmax_depth, cmap_name="viridis")
+                    #     if text_overlay:
+                    #         annotate_png_top_left(p3, text_overlay)
                                     # === NEW: disparity gradient 시각화 저장 ===
                 if args.save_color and args.save_disp_grads:
                     # 어떤 해상도에서 계산/저장할지 선택
@@ -577,14 +577,14 @@ def run_inference(args):
                         save_npy(os.path.join(out_vis, f"{stem}_err_d1_full.npy"), d1_mask_full_np.astype(np.float32))
 
                     # 저장: PNG (컬러/그레이)
-                    if args.save_color:
-                        vmax_err = args.vmax_err if (args.vmax_err is not None and args.vmax_err > 0) else None
-                        save_colormap_png(os.path.join(out_vis, f"{stem}_err_epe_1_4_px.png"),
-                                          epe_map_q_np, vmax=vmax_err)
-                        save_colormap_png(os.path.join(out_vis, f"{stem}_err_epe_full_px.png"),
-                                          epe_map_full_np, vmax=vmax_err)
-                        save_gray_png(os.path.join(out_vis, f"{stem}_err_d1_1_4.png"), d1_mask_q_np)
-                        save_gray_png(os.path.join(out_vis, f"{stem}_err_d1_full.png"), d1_mask_full_np)
+                    # if args.save_color:
+                    #     vmax_err = args.vmax_err if (args.vmax_err is not None and args.vmax_err > 0) else None
+                    #     save_colormap_png(os.path.join(out_vis, f"{stem}_err_epe_1_4_px.png"),
+                    #                       epe_map_q_np, vmax=vmax_err)
+                    #     save_colormap_png(os.path.join(out_vis, f"{stem}_err_epe_full_px.png"),
+                    #                       epe_map_full_np, vmax=vmax_err)
+                    #     save_gray_png(os.path.join(out_vis, f"{stem}_err_d1_1_4.png"), d1_mask_q_np)
+                    #     save_gray_png(os.path.join(out_vis, f"{stem}_err_d1_full.png"), d1_mask_full_np)
 
                 # CSV 로깅
                 if metrics_csv_fp is not None:
@@ -616,9 +616,9 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
 
     # 모델/디코더 (학습과 동일하게 맞춰야 정확)
-    p.add_argument("--max_disp_px", type=int, default=64)
+    p.add_argument("--max_disp_px", type=int, default=60)
     p.add_argument("--fused_ch",    type=int, default=320)
-    p.add_argument("--acv_red_ch",  type=int, default=64)
+    p.add_argument("--acv_red_ch",  type=int, default=96)
     p.add_argument("--agg_ch",      type=int, default=64)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)

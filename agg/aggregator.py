@@ -356,6 +356,7 @@ class SOTAStereoDecoder(nn.Module):
             "prob_volume_1_4": prob,
             "corr_volume_1_4": corr_vol,
             "disp_1_4_stage1": disp_q,
+            "logits_1_4": -logits,
         }
 
         # --- (optional) Stage-2: local-range refine (IGEV++ spirit) ---
@@ -399,11 +400,13 @@ class SOTAStereoDecoder(nn.Module):
             logits2 = self.agg_local(vol_loc)                 # [B,Dloc,H4,W4]
             prob2   = F.softmax(-logits2, dim=1)
             disp_ref_cell = soft_argmin(prob2) + (d0 - self.local_r)  # re-center
+            disp_idx = torch.argmax(prob, dim=1, keepdim=True).to(prob.dtype) * 4.0
             disp_q = disp_ref_cell * 4.0
 
             out.update({
                 "prob_volume_local_1_4": prob2,
-                "disp_1_4_stage2": disp_q
+                "disp_1_4_stage2": disp_q,
+                "logits_1_4_ref": -logits2,
             })
 
         # --- Full-res refine ---
