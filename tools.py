@@ -696,14 +696,13 @@ def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device: torch.
                 state[k] = v.to(device)
 
 def save_checkpoint(path: str, epoch: int, model: nn.Module,
-                    optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler,
+                    optim: torch.optim.Optimizer, 
                     args):
     ckpt = {
         "epoch": epoch,
         "model": model.state_dict(),
         "optim": optim.state_dict(),
         "args": vars(args),
-        "scaler": (scaler.state_dict() if scaler is not None else None),
         "rng_python": random.getstate(),
         "rng_numpy":  np.random.get_state(),
         "rng_torch":  torch.get_rng_state(),

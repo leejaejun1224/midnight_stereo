@@ -266,17 +266,17 @@ def train(args):
         autopad_to_8=False,   # << 입력은 외부에서 16배수 패딩
     ).to(device).train()
 
-    # decoder = SOTAStereoDecoder(
-    #     max_disp_px=args.max_disp_px,
-    #     fused_in_ch=args.fused_ch,
-    #     red_ch=args.acv_red_ch,
-    #     base3d=args.agg_ch,
-    #     use_motif=args.use_motif,
-    #     two_stage=args.two_stage,
-    #     local_radius_cells=args.local_radius
-    # ).to(device).train()
+    decoder = SOTAStereoDecoder(
+        max_disp_px=args.max_disp_px,
+        fused_in_ch=args.fused_ch,
+        red_ch=args.acv_red_ch,
+        base3d=args.agg_ch,
+        use_motif=args.use_motif,
+        two_stage=args.two_stage,
+        local_radius_cells=args.local_radius
+    ).to(device).train()
 
-    decoder = IGEVStereo(args).to(device).train()
+    # decoder = IGEVStereo(args).to(device).train()
 
     ckpt_model = torch.nn.ModuleDict({
         "stereo": stereo,
@@ -326,6 +326,7 @@ def train(args):
 
     # --- 체크포인트 재개 ---
     start_epoch = 1
+
     if args.resume and HAS_CKPT:
         start_epoch, _, ckpt = resume_from_checkpoint(args,ckpt_model, device)
         if (ckpt is not None) and ("optim" in ckpt) and (not args.resume_reset_optim):
@@ -346,10 +347,15 @@ def train(args):
 
     # --- 학습 루프 ---
     stereo.train(); decoder.train()
+    decayed = False
     for epoch in range(start_epoch, args.epochs + 1):
         rtlog.start_epoch()
         running = 0.0
-
+        if (not decayed) and (epoch >= args.decay_epoch):
+            for g in optim.param_groups:
+                g["lr"] *= 0.1
+            decayed = True
+            print(f"[Epoch {epoch}] LR decayed x0.1 → {optim.param_groups[0]['lr']:.3e}")
         for it, (imgL, imgR, names) in enumerate(loader, start=1):
             imgL = imgL.to(device, non_blocking=True)  # ImageNet 정규화 가정
             imgR = imgR.to(device, non_blocking=True)
@@ -360,8 +366,8 @@ def train(args):
                 imgR_01 = denorm_imagenet(imgR)
 
             # === 1) 입력 16배수 패딩 ===
-            imgL_pad, pad = pad_to_multiple(imgL,  mult=32, mode="replicate")
-            imgR_pad, _   = pad_to_multiple(imgR,  mult=32, mode="replicate")
+            imgL_pad, pad = pad_to_multiple(imgL,  mult=16, mode="replicate")
+            imgR_pad, _   = pad_to_multiple(imgR,  mult=16, mode="replicate")
 
             # pad = (pad_b, pad_r) 이고, 16배수라서 pad_b%4==0, pad_r%4==0 이 보장됨
             assert pad[0] % 4 == 0 and pad[1] % 4 == 0, "pad must be divisible by 4"
@@ -370,10 +376,10 @@ def train(args):
                 # 2) 백본/디코더 실행
                 bb_out = stereo(imgL_pad, imgR_pad)
                 # for sota 어쩌고
-                # pred   = decoder(bb_out)
+                pred   = decoder(bb_out)
                 
                 # 이건 igev 디코더용
-                pred   = decoder(imgL_pad, imgR_pad, bb_out["left"]["fused_1_4"], bb_out["right"]["fused_1_4"], iters=args.igev_iters)
+                # pred   = decoder(imgL_pad, imgR_pad, bb_out["left"]["fused_1_4"], bb_out["right"]["fused_1_4"], iters=args.igev_iters)
 
                 # 3) 출력 언패드 — 모두 1/4 해상도 좌표계(+Full-res)
                 pad_q = (pad[0] // 4, pad[1] // 4)
@@ -563,10 +569,10 @@ def get_args():
     # 모델/디코더
     p.add_argument("--max_disp_px", type=int, default=60)
     p.add_argument("--fused_ch",    type=int, default=320)
-    p.add_argument("--acv_red_ch",  type=int, default=96)
-    p.add_argument("--agg_ch",      type=int, default=64)
+    p.add_argument("--acv_red_ch",  type=int, default=128)
+    p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
-    p.add_argument("--two_stage",   type=bool, default=False)
+    p.add_argument("--two_stage",   type=bool, default=True)
     p.add_argument("--local_radius", type=int, default=8)
     
     
@@ -580,7 +586,8 @@ def get_args():
     p.add_argument("--igev_iters",type=int, default=16)
     
     # 학습
-    p.add_argument("--epochs",     type=int, default=10)
+    p.add_argument("--epochs",     type=int, default=20)
+    p.add_argument("--decay_epoch", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
@@ -609,8 +616,8 @@ def get_args():
     p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=1.0)
-    p.add_argument("--vert_down_allow", type=float, default=1.0)
+    p.add_argument("--vert_up_allow",   type=float, default=0.5)
+    p.add_argument("--vert_down_allow", type=float, default=0.5)
     p.add_argument("--horiz_margin",    type=float, default=0.0)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
