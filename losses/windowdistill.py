@@ -398,7 +398,7 @@ class AdaptiveWindowDistillLoss(nn.Module):
 
         is_logits = (student_out_L.dim()==4 and student_out_L.shape[1]==Dp1)
 
-
+   
         if is_logits:
             # KL(soft CE)
             log_q = F.log_softmax(student_out_L / max(self.T_student, 1e-6), dim=1)     # [B,D+1,H4,W4]
@@ -442,7 +442,7 @@ class AdaptiveWindowDistillLoss(nn.Module):
             "roi_ratio": float((roi_mask.float().mean()).item()),
             "invalid_before_ratio": float((invalid_before.float().mean()).item()),
         }
-        return loss, debug
+        return loss
 
 
 # # ============================================================

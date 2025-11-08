@@ -661,7 +661,6 @@ class SOTAStereoDecoder(nn.Module):
             disp_ref_cell = soft_argmin(prob2) + (d0 - self.local_r)  # re-center
             disp_idx = torch.argmax(prob, dim=1, keepdim=True).to(prob.dtype) * 4.0
             disp_q = disp_ref_cell * 4.0
-
             out.update({
                 "prob_volume_local_1_4": prob2,
                 "disp_1_4_stage2": disp_q,

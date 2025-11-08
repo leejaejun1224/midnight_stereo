@@ -37,6 +37,7 @@ from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
     FeatureReprojLoss,
     AdaptiveWindowDistillLoss,
+    ROIEntropySmoothL1Loss
     # PhotometricLoss,
 )
 torch.backends.cudnn.benchmark = True
@@ -304,6 +305,19 @@ def train(args):
             weight_gamma=0.5, weight_delta=1.0,
             gap_min=1.0, gap_norm=4.0, L0=8.0
         ).to(device)
+    roi_l1_crit = ROIEntropySmoothL1Loss(
+        max_disp=int(args.max_disp_px // 4),      # 1/4 그리드 단위
+        roi_mode=args.roi_mode,
+        roi_u0=args.roi_u0, roi_u1=args.roi_u1,
+        roi_v0=args.roi_v0, roi_v1=args.roi_v1,
+        ent_T=args.roi_ent_T, ent_thr=args.roi_ent_thr,  # invalid_before 필터 전용
+        max_half=args.roi_win_half_max,
+        teacher_type=args.roi_teacher,  # "arg" 권장
+        T_teacher=0.1,
+        beta=args.roi_beta,
+        apply_area="roi",
+        student_unit="px"               # pred["disp_1_4"]는 px 단위(1/4 해상도)
+    ).to(device)
     
     # (선택) Feature reprojection loss — args.w_reproj 있을 때만 켜기
     w_reproj = float(getattr(args, "w_reproj", 0.0))
@@ -438,9 +452,12 @@ def train(args):
                 photo_map_full  = photo_crit.simple_photometric_loss(imgL_01, imgR_full_warp, weights=[args.photo_l1_w, args.photo_ssim_w])
                 loss_photo_full = (photo_map_full * valid_full).sum() / (valid_full.sum() + 1e-6)
                 loss_photo_full = loss_photo_full * args.w_photo_fullres
-                # logits = unpad_last2(pred["logits_1_4"], pad_q)
-                # distillloss, info = criterion(FqL, FqR, logits, return_debug=True)
-                
+                if "logits_1_4_ref" in pred:
+                    logits = unpad_last2(pred["logits_1_4"], pad_q)
+                else:
+                    logits = unpad_last2(pred["logits_1_4"], pad_q)
+                distill_loss = criterion(FqL, FqR, logits, return_debug=True) * args.w_distill
+                loss_roi_l1 = roi_l1_crit(FqL, FqR, disp_q_px) * args.w_roi_l1
                 # Smoothness @Full-res
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
 
@@ -449,7 +466,7 @@ def train(args):
                     loss_dir
                     + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
                 )
-                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full # distillloss*args.w_distill
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full + distill_loss + loss_roi_l1
 
             # 최적화
             optim.zero_grad(set_to_none=True)
@@ -543,6 +560,7 @@ def train(args):
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
                       f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
+                      f"distill={float(distill_loss):.4f} "
                       f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
                       f"photoF={float(loss_photo_full):.4f}, smoothF={float(loss_smooth_full):.4f})"
                       f"{extra_eval}")
@@ -583,6 +601,7 @@ current_time = datetime.now(tz=timezone.utc).astimezone(timezone(timedelta(hours
 def get_args():
     p = argparse.ArgumentParser("Stereo — All losses @1/4 + Full-res photometric/smooth (inputs padded to ×16, outputs unpadded)")
 
+
     # 데이터
     p.add_argument("--left_dir",  type=str, required=True)
     p.add_argument("--right_dir", type=str, required=True)
@@ -597,8 +616,8 @@ def get_args():
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
     p.add_argument("--local_radius", type=int, default=8)
-    
-    
+
+    # (IGE V params — 보유 시)
     p.add_argument("--hidden_dims", default=[128, 128, 128])
     p.add_argument("--n_downsample", type=int, default=2)
     p.add_argument("--n_gru_layers", type=int, default=3)
@@ -607,7 +626,7 @@ def get_args():
     p.add_argument("--mixed_precision",type=bool, default=True)
     p.add_argument("--precision_dtype",type=str, default="float16")
     p.add_argument("--igev_iters",type=int, default=16)
-    
+
     # 학습
     p.add_argument("--epochs",     type=int, default=20)
     p.add_argument("--decay_epoch", type=int, default=10)
@@ -617,25 +636,23 @@ def get_args():
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--amp",    dest="amp", action="store_true")
     p.add_argument("--seed",       type=int, default=42)
+
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
     p.add_argument("--w_reproj",           type=float, default=1.0)
-    p.add_argument("--w_distill",           type=float, default=0.5)
-    # 1/4 해상도
+    p.add_argument("--w_distill",          type=float, default=0.0)
     p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
-    # Full-res 추가
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.1, help="Smoothness  @Full-res")
-    # photometric 내부 가중(공통)
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.1,   help="Smoothness  @Full-res")
+
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
-    
 
-    # DirectionalRelScaleDispLoss 하이퍼 (cossim + 세로 [-1,0]/[0,1])
+    # DirectionalRelScaleDispLoss 하이퍼
     p.add_argument("--sim_thr",      type=float, default=0.8)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
-    p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
+    p.add_argument("--sim_sample_k", type=int,   default=1024)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
     p.add_argument("--vert_up_allow",   type=float, default=0.4)
@@ -645,6 +662,19 @@ def get_args():
     p.add_argument("--lambda_h",     type=float, default=1.0)
     p.add_argument("--huber_delta_h", type=float, default=1.0)
 
+    # --- ROIEntropySmoothL1Loss 하이퍼 ---
+    p.add_argument("--w_roi_l1",        type=float, default=0.5,  help="가중치: ROIEntropySmoothL1Loss")
+    p.add_argument("--roi_mode",        type=str,   default="frac", choices=["frac","abs4"])
+    p.add_argument("--roi_u0",          type=float, default=0.3)
+    p.add_argument("--roi_u1",          type=float, default=0.7)
+    p.add_argument("--roi_v0",          type=float, default=2/3)
+    p.add_argument("--roi_v1",          type=float, default=1.0)
+    p.add_argument("--roi_ent_T",       type=float, default=0.1)
+    p.add_argument("--roi_ent_thr",     type=float, default=0.65)
+    p.add_argument("--roi_win_half_max",type=int,   default=12)
+    p.add_argument("--roi_teacher",     type=str,   default="arg", choices=["arg","soft"])
+    p.add_argument("--roi_beta",        type=float, default=1.0)
+
     # 로깅/저장/재개
     p.add_argument("--log_every",   type=int, default=10)
     p.add_argument("--save_every",  type=int, default=1)
@@ -653,7 +683,7 @@ def get_args():
     p.add_argument("--resume_reset_optim",  action="store_true")
     p.add_argument("--resume_reset_scaler", action="store_true")
 
-    # --- 실시간 정량평가 옵션 (모두 1/4 해상도 기준) ---
+    # --- 실시간 정량평가 옵션 ---
     p.add_argument("--realtime_test", action="store_true")
     p.add_argument("--gt_depth_dir",  type=str, default=None)
     p.add_argument("--gt_depth_scale", type=float, default=256.0)

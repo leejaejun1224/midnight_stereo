@@ -116,7 +116,7 @@ def main(left_path, right_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Click corresponding points to measure disparity (uL - uR).")
-    parser.add_argument("--left", default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_left/000967.png", help="Left image path")
-    parser.add_argument("--right", default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_right/000967.png", help="Right image path")
+    parser.add_argument("--left", default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_left/000000.png", help="Left image path")
+    parser.add_argument("--right", default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_right/000000.png", help="Right image path")
     args = parser.parse_args()
     main(args.left, args.right)
