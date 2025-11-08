@@ -165,63 +165,195 @@ class Basic3D(nn.Module):
         )
     def forward(self, x): return self.conv(x)
 
-# class Hourglass3D(nn.Module):
-#     def __init__(self, in_ch: int, base: int = 32):
-#         super().__init__()
-#         c = base
-#         self.in_block = Basic3D(in_ch, c)
-#         self.down1 = Basic3D(c, c, s=2)
-#         self.down2 = Basic3D(c, c*2, s=2)
-#         self.mid   = Basic3D(c*2, c*2)
-#         # ✔ output_padding을 고정값(=1)으로 박지 않습니다.
-#         self.up1   = nn.ConvTranspose3d(c*2, c, 3, 2, 1)  # output_padding 생략
-#         self.up2   = nn.ConvTranspose3d(c, c, 3, 2, 1)    # output_padding 생략
-#         self.post  = Basic3D(c, c)
-#         self.out   = nn.Conv3d(c, 1, 3, 1, 1)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x0 = self.in_block(x)  # [B,c, D0,H0,W0]
-#         x1 = self.down1(x0)    # [B,c, D1,H1,W1]
-#         x2 = self.down2(x1)    # [B,2c,D2,H2,W2]
-#         xm = self.mid(x2)      # [B,2c,D2,H2,W2]
-
-#         # ✔ 업샘플 때 목표 사이즈를 명시해서 스킵과 정확히 일치시킵니다.
-#         y  = self.up1(xm, output_size=x1.shape[-3:]) + x1
-#         y  = self.up2(y,  output_size=x0.shape[-3:]) + x0
-
-#         y  = self.post(y)
-#         return self.out(y).squeeze(1)  # [B,D0,H0,W0]
-
 class Hourglass3D(nn.Module):
     def __init__(self, in_ch: int, base: int = 32):
         super().__init__()
         c = base
         self.in_block = Basic3D(in_ch, c)
-        self.down1 = nn.Conv3d(c,   c,   3, stride=(1,2,2), padding=1, bias=False)
-        self.bn1   = nn.BatchNorm3d(c);  self.relu = nn.ReLU(inplace=True)
-        self.down2 = nn.Conv3d(c,   c*2, 3, stride=(1,2,2), padding=1, bias=False)
-        self.bn2   = nn.BatchNorm3d(c*2)
-
+        self.down1 = Basic3D(c, c, s=2)
+        self.down2 = Basic3D(c, c*2, s=2)
         self.mid   = Basic3D(c*2, c*2)
-
-        # ✅ 바뀌는 곳: 업샘플을 (1,4,4)/(1,2,2)/(0,1,1)로 → H/W 정확히 ×2
-        self.up1   = nn.ConvTranspose3d(c*2, c, kernel_size=(1,4,4),
-                                        stride=(1,2,2), padding=(0,1,1), bias=False)
-        self.up2   = nn.ConvTranspose3d(c,   c, kernel_size=(1,4,4),
-                                        stride=(1,2,2), padding=(0,1,1), bias=False)
-
+        # ✔ output_padding을 고정값(=1)으로 박지 않습니다.
+        self.up1   = nn.ConvTranspose3d(c*2, c, 3, 2, 1)  # output_padding 생략
+        self.up2   = nn.ConvTranspose3d(c, c, 3, 2, 1)    # output_padding 생략
         self.post  = Basic3D(c, c)
         self.out   = nn.Conv3d(c, 1, 3, 1, 1)
 
-    def forward(self, x):
-        x0 = self.in_block(x)
-        x1 = self.relu(self.bn1(self.down1(x0)))
-        x2 = self.relu(self.bn2(self.down2(x1)))
-        xm = self.mid(x2)
-        y  = self.up1(xm) + x1  # 정렬 보장
-        y  = self.up2(y)  + x0  # 정렬 보장
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.in_block(x)  # [B,c, D0,H0,W0]
+        x1 = self.down1(x0)    # [B,c, D1,H1,W1]
+        x2 = self.down2(x1)    # [B,2c,D2,H2,W2]
+        xm = self.mid(x2)      # [B,2c,D2,H2,W2]
+
+        # ✔ 업샘플 때 목표 사이즈를 명시해서 스킵과 정확히 일치시킵니다.
+        y  = self.up1(xm, output_size=x1.shape[-3:]) + x1
+        y  = self.up2(y,  output_size=x0.shape[-3:]) + x0
+
         y  = self.post(y)
-        return self.out(y).squeeze(1)
+        return self.out(y).squeeze(1)  # [B,D0,H0,W0]
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple
+
+# --------- GN 기반 블록들 ---------
+class Conv3dGN(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, groups=8, act=True, bias=False):
+        super().__init__()
+        self.conv = nn.Conv3d(in_ch, out_ch, k, s, p, bias=bias)
+        self.gn   = nn.GroupNorm(groups, out_ch)
+        self.act  = nn.ReLU(inplace=True) if act else nn.Identity()
+    def forward(self, x):
+        return self.act(self.gn(self.conv(x)))
+
+class ResBlock3D_GN(nn.Module):
+    def __init__(self, ch, dilation: Tuple[int,int,int]=(1,1,1), groups=8):
+        super().__init__()
+        d = dilation
+        self.c1 = Conv3dGN(ch, ch, k=3, s=1, p=d, groups=groups, act=True,  bias=False)
+        self.c1.conv.dilation = d
+        self.c2 = Conv3dGN(ch, ch, k=3, s=1, p=d, groups=groups, act=False, bias=False)
+        self.c2.conv.dilation = d
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        y = self.c2(self.c1(x))
+        return self.act(x + y)
+
+class DMix3D(nn.Module):
+    """
+    D축만 1/2로 내렸다 올려 문맥 섞기.
+    output_size를 명시해서 입력과 정확히 동일한 (D,H,W)로 복원.
+    """
+    def __init__(self, ch, levels=1, groups=8):
+        super().__init__()
+        self.levels = levels
+
+        self.downs      = nn.ModuleList()
+        self.down_norms = nn.ModuleList()
+        self.ups        = nn.ModuleList()
+        self.up_norms   = nn.ModuleList()
+        self.act = nn.ReLU(inplace=True)
+
+        for _ in range(levels):
+            self.downs.append(nn.Conv3d(
+                ch, ch, kernel_size=(3,1,1), stride=(2,1,1), padding=(1,0,0), bias=False
+            ))
+            self.down_norms.append(nn.GroupNorm(num_groups=min(8, ch), num_channels=ch))
+
+            self.ups.append(nn.ConvTranspose3d(
+                ch, ch, kernel_size=(3,1,1), stride=(2,1,1), padding=(1,0,0), bias=False
+            ))
+            self.up_norms.append(nn.GroupNorm(num_groups=min(8, ch), num_channels=ch))
+
+    def forward(self, x):
+        y = x
+        for i in range(self.levels):
+            z = self.act(self.down_norms[i](self.downs[i](y)))
+            # *** 핵심: 입력 y의 (D,H,W)로 정확히 복원 ***
+            z = self.ups[i](z, output_size=y.shape[-3:])
+            z = self.act(self.up_norms[i](z))
+            y = y + z
+        return y
+
+
+# --------- Hourglass3DPlusXL ---------
+class Hourglass3DPlusXL(nn.Module):
+    """
+    배치=1에 맞춘 대형 hourglass:
+      - D축 문맥 강한 집계(DMix3D, dilated ResBlocks)
+      - 스킵은 합(+)로 통계 안정
+      - 전체 GroupNorm 사용
+      - 업샘플은 (1,4,4)/(1,2,2)/(0,1,1) → H/W 정확히 ×2 (output_size 불필요)
+    입력:  [B, Cin, D, H, W]   (Cin = 2*Cr)
+    출력:  [B, D, H, W]        (logits)
+    """
+    def __init__(self,
+                 in_ch: int,
+                 base: int = 32,
+                 gn_groups: int = 8,
+                 n_res_enc=(1,1),      # enc 각 단계 ResBlock 수
+                 n_res_mid=2,          # bottleneck ResBlock 수
+                 n_res_dec=(1,1),      # dec 각 단계 ResBlock 수
+                 use_dmix=True,
+                 logit_scale: float = 1.2  # 마지막 conv 가중 스케일
+                 ):
+        super().__init__()
+        c = base
+        g = gn_groups
+
+        # Stem
+        self.stem = nn.Sequential(
+            Conv3dGN(in_ch, c, k=3, s=1, p=1, groups=g, act=True),
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_enc[0])]
+        )
+
+        # Down1: D 고정, H/W 1/2
+        self.down1 = nn.Sequential(
+            Conv3dGN(c, c, k=3, s=(1,2,2), p=1, groups=g, act=True),
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_enc[1])]
+        )
+
+        # Down2: D 고정, H/W 1/2 (채널 확장 2c)
+        self.down2 = nn.Sequential(
+            Conv3dGN(c, 2*c, k=3, s=(1,2,2), p=1, groups=g, act=True)
+        )
+
+        # Bottleneck: dilated + (opt) D‑mix 피라미드
+        mid_blocks = [ResBlock3D_GN(2*c, dilation=(1,1,1), groups=g)]
+        mid_blocks += [ResBlock3D_GN(2*c, dilation=(2,1,1), groups=g) for _ in range(max(0, n_res_mid-1))]
+        self.mid = nn.Sequential(*mid_blocks)
+        self.dmix = DMix3D(2*c, groups=g) if use_dmix else nn.Identity()
+
+        # Up1: H/W ×2 (정렬 보장), 스킵은 합(+)
+        self.up1 = nn.ConvTranspose3d(2*c, c, kernel_size=(1,4,4),
+                                      stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.up1_gn = nn.GroupNorm(g, c)
+        self.up1_act= nn.ReLU(inplace=True)
+        self.dec1 = nn.Sequential(
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_dec[0])]
+        )
+
+        # Up2: H/W ×2 (정렬 보장), 스킵은 합(+)
+        self.up2 = nn.ConvTranspose3d(c, c, kernel_size=(1,4,4),
+                                      stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.up2_gn = nn.GroupNorm(g, c)
+        self.up2_act= nn.ReLU(inplace=True)
+        self.dec0 = nn.Sequential(
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_dec[1])]
+        )
+
+        # Head → 1채널 logits
+        self.head = nn.Conv3d(c, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        nn.init.kaiming_normal_(self.head.weight, nonlinearity='linear')
+        with torch.no_grad():
+            self.head.weight.mul_(logit_scale)  # 초반 피크 강화(온도 안정)
+
+    def forward(self, x):
+        # enc
+        x0 = self.stem(x)          # [B,c,  D, H,   W]
+        x1 = self.down1(x0)        # [B,c,  D, H/2, W/2]
+        x2 = self.down2(x1)        # [B,2c, D, H/4, W/4]
+
+        # mid
+        xm = self.mid(x2)          # [B,2c, D, H/4, W/4]
+        xm = self.dmix(xm)         # D축 문맥 강화
+
+        # dec1
+        y  = self.up1(xm)          # [B,c, D, H/2, W/2]
+        y  = self.up1_act(self.up1_gn(y))
+        y  = y + x1                 # skip: 합(+)
+        y  = self.dec1(y)
+
+        # dec0
+        y  = self.up2(y)           # [B,c, D, H,   W]
+        y  = self.up2_act(self.up2_gn(y))
+        y  = y + x0                 # skip: 합(+)
+        y  = self.dec0(y)
+
+        # logits [B, D, H, W]
+        return self.head(y).squeeze(1)
 
 class ConvexUpsampleX4(nn.Module):
     """
@@ -295,7 +427,104 @@ class ConvexUpsampleX4(nn.Module):
         disp_full = disp_full + self.residual_head(torch.cat([disp_full, fused_up], dim=1))
 
         return disp_full
-    
+
+
+class ConvexUpsampleX4Lite(nn.Module):
+    """
+    메모리 세이프 convex 업샘플(+옵션 residual).
+    - 마스크 예측: 그대로 (저해상도 Cf 사용 → 메모리 영향 적음)
+    - residual: 풀해상도에서 Cf 대신 'ctx_ch'(작은 채널)만 사용
+    """
+    def __init__(self, cf: int = 256, k: int = 3, scale: int = 4,
+                 mid_mask: int = 64,     # 마스크 예측 중간 채널 (기존 128 → 64로 감량)
+                 ctx_ch: int = 24,       # 풀해상도 residual에 쓸 경량 컨텍스트 채널 수
+                 mid_residual: int = 64, # residual 중간 채널
+                 use_residual: bool = True):
+        super().__init__()
+        assert k == 3
+        self.k = k
+        self.s = scale
+        kk = k * k
+        ss = scale * scale
+        self.use_residual = use_residual
+
+        # (1) 마스크 예측은 저해상도에서 수행 → 그대로 두되 중간 채널만 축소
+        self.mask_pred = nn.Sequential(
+            nn.Conv2d(cf,      mid_mask, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_mask, ss * kk, 1, 1, 0)
+        )
+
+        # (2) residual용 컨텍스트를 저해상도에서 미리 1x1로 축소 → 업샘플
+        if use_residual:
+            self.ctx_reduce = nn.Conv2d(cf, ctx_ch, 1, 1, 0)
+            self.residual_head = nn.Sequential(
+                nn.Conv2d(1 + ctx_ch, mid_residual, 3, 1, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(mid_residual, 1, 3, 1, 1)
+            )
+
+        # 초기화
+        for m in self.mask_pred.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=1.0); nn.init.zeros_(m.bias)
+        if use_residual:
+            for m in self.residual_head.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu"); nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def _check_shapes(self, disp_q, fused_q):
+        B, _, h, w  = disp_q.shape
+        B2, Cf, h2, w2 = fused_q.shape
+        assert B == B2 and h == h2 and w == w2, f"shape mismatch: disp {disp_q.shape}, fused {fused_q.shape}"
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor) -> torch.Tensor:
+        """
+        in:
+          disp_q  : [B,1,h,w]   (1/4 해상도 disparity)
+          fused_q : [B,Cf,h,w]  (1/4 해상도 컨텍스트)
+        out:
+          disp_full: [B,1,4h,4w]
+        """
+        self._check_shapes(disp_q, fused_q)
+        B, _, h, w = disp_q.shape
+        kk, ss, s  = self.k * self.k, self.s * self.s, self.s
+
+        # 1) convex 마스크 (저해상도)
+        mask_logits = self.mask_pred(fused_q)               # [B, ss*kk, h, w]
+        mask = mask_logits.view(B, ss, kk, h, w)
+        mask = F.softmax(mask, dim=2)
+
+        # 2) 3x3 패치 펼치기 (저해상도)
+        disp_unf = F.unfold(disp_q, kernel_size=self.k, padding=self.k//2)  # [B, kk, h*w]
+        disp_unf = disp_unf.view(B, 1, kk, h, w)
+
+        # 3) 볼록 결합 → [B, ss, h, w]
+        up = (mask * disp_unf).sum(dim=2)
+
+        # 4) PixelShuffle로 x4 업샘플 → [B,1,4h,4w]
+        disp_full = F.pixel_shuffle(up, upscale_factor=s)
+
+        if not self.use_residual:
+            return disp_full
+
+        # 5) 메모리 세이프 residual: Cf를 바로 업샘플하지 말고, 저해상도에서 축소 후 업샘플
+        ctx_small = self.ctx_reduce(fused_q)                             # [B, ctx_ch, h, w]
+        ctx_up    = F.interpolate(ctx_small, size=(h*s, w*s), mode="bilinear", align_corners=False)  # [B,ctx_ch,4h,4w]
+
+        # 6) 잔차 보정
+        disp_full = disp_full + self.residual_head(torch.cat([disp_full, ctx_up], dim=1))
+        return disp_full
+
+class FullRefineLite(nn.Module):
+    def __init__(self, cf: int = 256, use_residual: bool = True,
+                 ctx_ch: int = 24, mid_residual: int = 64, mid_mask: int = 64):
+        super().__init__()
+        self.up = ConvexUpsampleX4Lite(cf=cf, use_residual=use_residual,
+                                       ctx_ch=ctx_ch, mid_residual=mid_residual, mid_mask=mid_mask)
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor, out_hw=None) -> torch.Tensor:
+        return self.up(disp_q, fused_q)
+
 class FullRefine(nn.Module):
     def __init__(self, cf: int = 256, mid: int = 64):
         super().__init__()
@@ -321,8 +550,9 @@ class SOTAStereoDecoder(nn.Module):
         self.D = max(1, max_disp_px // 4)
         self.concat = ConcatVolume1_4(in_ch=fused_in_ch, red_ch=red_ch)
         self.acv = ACVAttention(out_ch=2 * red_ch, hidden=16)
-        self.agg = Hourglass3D(in_ch=2 * red_ch, base=base3d)
-        self.refine_full = FullRefine(cf=fused_in_ch)
+        self.agg = Hourglass3DPlusXL(in_ch=2 * red_ch, base=base3d)
+        # self.refine_full = FullRefine(cf=fused_in_ch)
+        self.refine_full = FullRefineLite(cf=fused_in_ch, use_residual=True, ctx_ch=24, mid_residual=64, mid_mask=64)
 
         self.use_motif = use_motif
         if use_motif:
@@ -336,7 +566,7 @@ class SOTAStereoDecoder(nn.Module):
         if two_stage:
             # second aggregation head for local window
             self.acv_local = ACVAttention(out_ch=2 * red_ch, hidden=8)
-            self.agg_local = Hourglass3D(in_ch=2 * red_ch, base=base3d)
+            self.agg_local = Hourglass3DPlusXL(in_ch=2 * red_ch, base=base3d)
 
         self.corr_builder = CorrVolume1_4(max_disp_px=max_disp_px)
 

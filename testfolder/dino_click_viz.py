@@ -204,7 +204,7 @@ def interactive_view(img_pil, feats_q):
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, required=True, help="입력 이미지 경로")
+    parser.add_argument("--image", type=str, default="/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_left/000042.png", help="입력 이미지 경로")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--pad_right_bottom_to_8", action="store_true",
                         help="입력 H,W가 8의 배수가 아니면 오른쪽/아래로 8의 배수까지 패딩합니다.")
