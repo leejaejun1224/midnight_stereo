@@ -592,7 +592,7 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--amp",        type=bool, default=False)
+    p.add_argument("--amp",        type=bool, default=True)
     p.add_argument("--seed",       type=int, default=42)
 
     # 손실 가중치

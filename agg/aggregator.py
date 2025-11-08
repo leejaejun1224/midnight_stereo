@@ -170,27 +170,127 @@ class Hourglass3D(nn.Module):
         super().__init__()
         c = base
         self.in_block = Basic3D(in_ch, c)
-        self.down1 = Basic3D(c, c, s=2)
-        self.down2 = Basic3D(c, c*2, s=2)
+        # D stride=1, HW stride=2 → (1,2,2)
+        self.down1 = nn.Conv3d(c,   c,   3, stride=(1,2,2), padding=1, bias=False)
+        self.bn1   = nn.BatchNorm3d(c);  self.relu = nn.ReLU(inplace=True)
+        self.down2 = nn.Conv3d(c,   c*2, 3, stride=(1,2,2), padding=1, bias=False)
+        self.bn2   = nn.BatchNorm3d(c*2)
+
         self.mid   = Basic3D(c*2, c*2)
-        # ✔ output_padding을 고정값(=1)으로 박지 않습니다.
-        self.up1   = nn.ConvTranspose3d(c*2, c, 3, 2, 1)  # output_padding 생략
-        self.up2   = nn.ConvTranspose3d(c, c, 3, 2, 1)    # output_padding 생략
+
+        self.up1   = nn.ConvTranspose3d(c*2, c,   3, stride=(1,2,2), padding=1)  # output_size 불필요
+        self.up2   = nn.ConvTranspose3d(c,   c,   3, stride=(1,2,2), padding=1)
         self.post  = Basic3D(c, c)
         self.out   = nn.Conv3d(c, 1, 3, 1, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.in_block(x)  # [B,c, D0,H0,W0]
-        x1 = self.down1(x0)    # [B,c, D1,H1,W1]
-        x2 = self.down2(x1)    # [B,2c,D2,H2,W2]
-        xm = self.mid(x2)      # [B,2c,D2,H2,W2]
-
-        # ✔ 업샘플 때 목표 사이즈를 명시해서 스킵과 정확히 일치시킵니다.
-        y  = self.up1(xm, output_size=x1.shape[-3:]) + x1
-        y  = self.up2(y,  output_size=x0.shape[-3:]) + x0
-
+    def forward(self, x):
+        x0 = self.in_block(x)
+        x1 = self.relu(self.bn1(self.down1(x0)))
+        x2 = self.relu(self.bn2(self.down2(x1)))
+        xm = self.mid(x2)
+        y  = self.up1(xm) + x1
+        y  = self.up2(y)  + x0
         y  = self.post(y)
-        return self.out(y).squeeze(1)  # [B,D0,H0,W0]
+        return self.out(y).squeeze(1)
+class ResBlock3D(nn.Module):
+    def __init__(self, ch, dilation=1):
+        super().__init__()
+        self.conv1 = nn.Conv3d(ch, ch, 3, 1, dilation, dilation, bias=False)
+        self.bn1   = nn.BatchNorm3d(ch)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(ch, ch, 3, 1, dilation, dilation, bias=False)
+        self.bn2   = nn.BatchNorm3d(ch)
+    def forward(self, x):
+        y = self.relu(self.bn1(self.conv1(x)))
+        y = self.bn2(self.conv2(y))
+        return self.relu(x + y)
+
+class Fuse3D(nn.Module):
+    """ skip concat 후 채널 축소 + 컨텍스트 보강 """
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 1, 1, 0, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, 3, 1, 1, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x): return self.fuse(x)
+
+class Hourglass3DPlus(nn.Module):
+    """
+    - D축 불변, H/W만 (1,2,2)로 다운 → (1,2,2) 업
+    - 업에서 k=(1,4,4), p=(0,1,1)로 out=2*in 보장 → output_size 불필요
+    - 스킵은 concat 후 Fuse3D로 융합(agg_0/agg_1 유사)
+    """
+    def __init__(self, in_ch: int, base: int = 32,
+                 nres_enc=(1,1,1), nres_dec=(1,1)):
+        super().__init__()
+        c = base
+
+        # stem
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_ch, c, 3, 1, 1, bias=False),
+            nn.BatchNorm3d(c), nn.ReLU(inplace=True),
+            *[ResBlock3D(c) for _ in range(nres_enc[0])]
+        )
+
+        # down1: D 고정, H/W 1/2
+        self.down1 = nn.Sequential(
+            nn.Conv3d(c, c, 3, stride=(1,2,2), padding=1, bias=False),
+            nn.BatchNorm3d(c), nn.ReLU(inplace=True),
+            *[ResBlock3D(c) for _ in range(nres_enc[1])]
+        )
+
+        # down2: D 고정, H/W 1/2 (채널 2c)
+        self.down2 = nn.Sequential(
+            nn.Conv3d(c, 2*c, 3, stride=(1,2,2), padding=1, bias=False),
+            nn.BatchNorm3d(2*c), nn.ReLU(inplace=True),
+            *[ResBlock3D(2*c) for _ in range(nres_enc[2])]
+        )
+
+        # bottleneck
+        self.mid = nn.Sequential(
+            ResBlock3D(2*c, dilation=1),
+            ResBlock3D(2*c, dilation=1),
+        )
+
+        # up1: 정확히 ×2 (H/W), skip concat → fuse
+        self.up1   = nn.ConvTranspose3d(2*c, c, kernel_size=(1,4,4),
+                                        stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.fuse1 = Fuse3D(in_ch=c + c, out_ch=c)
+        self.post1 = nn.Sequential(*[ResBlock3D(c) for _ in range(nres_dec[0])])
+
+        # up2: 정확히 ×2 (H/W), skip concat → fuse
+        self.up2   = nn.ConvTranspose3d(c, c, kernel_size=(1,4,4),
+                                        stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.fuse2 = Fuse3D(in_ch=c + c, out_ch=c)
+        self.post2 = nn.Sequential(*[ResBlock3D(c) for _ in range(nres_dec[1])])
+
+        # head
+        self.head = nn.Sequential(
+            nn.Conv3d(c, c, 3, 1, 1, bias=False),
+            nn.BatchNorm3d(c), nn.ReLU(inplace=True),
+            nn.Conv3d(c, 1, 3, 1, 1, bias=False)
+        )
+
+    def forward(self, x):
+        x0 = self.stem(x)    # [B,c,  D, H,   W]
+        x1 = self.down1(x0)  # [B,c,  D, H/2, W/2]
+        x2 = self.down2(x1)  # [B,2c, D, H/4, W/4]
+        xm = self.mid(x2)    # [B,2c, D, H/4, W/4]
+
+        y  = self.up1(xm)         # [B,c, D, H/2, W/2]
+        y  = self.fuse1(torch.cat([y, x1], dim=1))
+        y  = self.post1(y)
+
+        y  = self.up2(y)          # [B,c, D, H,   W]
+        y  = self.fuse2(torch.cat([y, x0], dim=1))
+        y  = self.post2(y)
+
+        return self.head(y).squeeze(1)  # [B, D, H, W]
 
 
 
@@ -292,7 +392,7 @@ class SOTAStereoDecoder(nn.Module):
         self.D = max(1, max_disp_px // 4)
         self.concat = ConcatVolume1_4(in_ch=fused_in_ch, red_ch=red_ch)
         self.acv = ACVAttention(out_ch=2 * red_ch, hidden=16)
-        self.agg = Hourglass3D(in_ch=2 * red_ch, base=base3d)
+        self.agg = Hourglass3DPlus(in_ch=2 * red_ch, base=base3d)
         self.refine_full = FullRefine(cf=fused_in_ch)
 
         self.use_motif = use_motif
@@ -307,7 +407,7 @@ class SOTAStereoDecoder(nn.Module):
         if two_stage:
             # second aggregation head for local window
             self.acv_local = ACVAttention(out_ch=2 * red_ch, hidden=8)
-            self.agg_local = Hourglass3D(in_ch=2 * red_ch, base=base3d)
+            self.agg_local = Hourglass3DPlus(in_ch=2 * red_ch, base=base3d)
 
         self.corr_builder = CorrVolume1_4(max_disp_px=max_disp_px)
 
