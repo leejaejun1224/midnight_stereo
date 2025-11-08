@@ -550,9 +550,9 @@ class SOTAStereoDecoder(nn.Module):
         self.D = max(1, max_disp_px // 4)
         self.concat = ConcatVolume1_4(in_ch=fused_in_ch, red_ch=red_ch)
         self.acv = ACVAttention(out_ch=2 * red_ch, hidden=16)
-        self.agg = Hourglass3DPlusXL(in_ch=2 * red_ch, base=base3d)
-        # self.refine_full = FullRefine(cf=fused_in_ch)
-        self.refine_full = FullRefineLite(cf=fused_in_ch, use_residual=True, ctx_ch=24, mid_residual=64, mid_mask=64)
+        self.agg = Hourglass3D(in_ch=2 * red_ch, base=base3d)
+        self.refine_full = FullRefine(cf=fused_in_ch)
+        # self.refine_full = FullRefineLite(cf=fused_in_ch, use_residual=True, ctx_ch=24, mid_residual=64, mid_mask=64)
 
         self.use_motif = use_motif
         if use_motif:
@@ -566,7 +566,7 @@ class SOTAStereoDecoder(nn.Module):
         if two_stage:
             # second aggregation head for local window
             self.acv_local = ACVAttention(out_ch=2 * red_ch, hidden=8)
-            self.agg_local = Hourglass3DPlusXL(in_ch=2 * red_ch, base=base3d)
+            self.agg_local = Hourglass3D(in_ch=2 * red_ch, base=base3d)
 
         self.corr_builder = CorrVolume1_4(max_disp_px=max_disp_px)
 
