@@ -597,14 +597,14 @@ def get_args():
 
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
-    p.add_argument("--w_reproj",           type=float, default=1.0)
+    p.add_argument("--w_reproj",           type=float, default=0.0)
     p.add_argument("--w_distill",           type=float, default=0.5)
     # 1/4 해상도
     p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
     # Full-res 추가
-    p.add_argument("--w_photo_fullres",    type=float, default=0.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.0, help="Smoothness  @Full-res")
+    p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.1, help="Smoothness  @Full-res")
     # photometric 내부 가중(공통)
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
@@ -616,8 +616,8 @@ def get_args():
     p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=0.5)
-    p.add_argument("--vert_down_allow", type=float, default=0.5)
+    p.add_argument("--vert_up_allow",   type=float, default=0.4)
+    p.add_argument("--vert_down_allow", type=float, default=0.4)
     p.add_argument("--horiz_margin",    type=float, default=0.0)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
