@@ -251,7 +251,7 @@ def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
     args_txt = save_args_txt_dynamic(args, save_dir=args.save_dir, filename="args.txt")
     print(f"[Args] Saved to {args_txt}")
-
+    print("amp enable : ", args.amp)
     # --- 데이터셋/로더 ---
     dataset = StereoFolderDataset(args.left_dir, args.right_dir,
                                   height=args.height, width=args.width)
@@ -592,7 +592,7 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--amp",        type=bool, default=True)
+    p.add_argument("--amp",    dest="amp", action="store_true")
     p.add_argument("--seed",       type=int, default=42)
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
