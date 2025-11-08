@@ -477,24 +477,37 @@ def train(args):
                         target_hw=(Hq, Wq),
                         device=imgL.device
                     )
+                    gt_depth = load_ms2_gt_depth_batch(
+                        names=names,
+                        gt_depth_dir=args.gt_depth_dir,
+                        scale=args.gt_depth_scale,
+                        target_hw=(Hq*4, Wq*4),
+                        device=imgL.device
+                    )
                     if gt_depth_q is not None:
-                        valid_mask = (gt_depth_q > 0).float()
+                        valid_mask_q = (gt_depth_q > 0).float()
+                        valid_mask = (gt_depth > 0).float()
                         has_fb = (getattr(args, "focal_px", 0.0) > 0.0) and (getattr(args, "baseline_m", 0.0) > 0.0)
                         if has_fb:
                             # --- Disparity metrics (px 기준) ---
                             gt_disp_q_px   = (args.focal_px * args.baseline_m) / gt_depth_q.clamp_min(1e-6) / 4.0  # px
                             pred_disp_q_px = disp_q_px  / 4.0                                                     # px
-                            disp_metrics   = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid_mask)
+                            disp_metrics_q   = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid_mask_q)
+
+                            if gt_depth is not None:
+                                gt_disp_px   = (args.focal_px * args.baseline_m) / gt_depth.clamp_min(1e-6)  # px
+                                disp_metrics   = compute_ms2_disparity_metrics(disp_full_px, gt_disp_px, valid_mask)
+
 
                             # --- Depth metrics (@1/4 격자) ---
                             fx_q = args.focal_px / 4.0
                             pred_depth_q = disparity_to_depth(disp_q_qpx, fx_q, args.baseline_m)  # disp: 1/4‑px, fx: fx/4
-                            depth_metrics = compute_depth_metrics(pred_depth_q, gt_depth_q, valid_mask)
+                            depth_metrics = compute_depth_metrics(pred_depth_q, gt_depth_q, valid_mask_q)
 
                             # --- Bin-weighted depth (선택) ---
                             if (args.eval_num_bins > 0) and (args.eval_max_depth_m > 0.0):
                                 depth_w = compute_bin_weighted_depth(
-                                    pred_depth_q, gt_depth_q, valid_mask,
+                                    pred_depth_q, gt_depth_q, valid_mask_q,
                                     max_depth_m=args.eval_max_depth_m,
                                     num_bins=args.eval_num_bins
                                 )
@@ -505,12 +518,22 @@ def train(args):
                                 try: return fmt.format(float(v))
                                 except: return "nan"
 
-                            extra_eval = (
-                                f" || [Disp(px)] EPE={_get(disp_metrics,'EPE')}  D1={_get(disp_metrics,'D1_all','{:.2f}')}%  "
-                                f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2px','{:.2f}')}%  "
-                                f"[Depth@1/4] AbsRel={_get(depth_metrics,'AbsRel')}  RMSE={_get(depth_metrics,'RMSE')}  "
-                                f"δ1={_get(depth_metrics,'δ<1.25')}"
-                            )
+
+                            if args.w_photo_fullres > 0.0:
+                                extra_eval = (
+                                    f" || [Disp(px)] EPE={_get(disp_metrics,'EPE')}  D1={_get(disp_metrics,'D1_all','{:.2f}')}%  "
+                                    f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2px','{:.2f}')}%  "
+                                    f"[Depth@1/4] AbsRel={_get(depth_metrics,'AbsRel')}  RMSE={_get(depth_metrics,'RMSE')}  "
+                                    f"δ1={_get(depth_metrics,'δ<1.25')}"
+                                )
+                                
+                            else:
+                                extra_eval = (
+                                    f" || [Disp(px)] EPE 1/4 ={_get(disp_metrics_q,'EPE')}  D1={_get(disp_metrics_q,'D1_all 1/4','{:.2f}')}%  "
+                                    f">1px={_get(disp_metrics_q,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics_q,'> 2px','{:.2f}')}%  "
+                                    f"[Depth@1/4] AbsRel={_get(disp_metrics_q,'AbsRel')}  RMSE={_get(disp_metrics_q,'RMSE')}  "
+                                    f"δ1={_get(disp_metrics_q,'δ<1.25')}"
+                                )
                         else:
                             extra_eval = " || [Calib] fx/baseline 미설정 → stereo/depth metric 생략"
 
@@ -567,7 +590,7 @@ def get_args():
     p.add_argument("--width",  type=int, default=1224)
 
     # 모델/디코더
-    p.add_argument("--max_disp_px", type=int, default=60)
+    p.add_argument("--max_disp_px", type=int, default=56)
     p.add_argument("--fused_ch",    type=int, default=320)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
@@ -596,11 +619,11 @@ def get_args():
     p.add_argument("--seed",       type=int, default=42)
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
-    p.add_argument("--w_reproj",           type=float, default=0.0)
+    p.add_argument("--w_reproj",           type=float, default=1.0)
     p.add_argument("--w_distill",           type=float, default=0.5)
     # 1/4 해상도
-    p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
-    p.add_argument("--w_smooth_qres",      type=float, default=0.01,  help="Smoothness  @1/4")
+    p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
+    p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
     # Full-res 추가
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
     p.add_argument("--w_smooth_fullres",   type=float, default=0.1, help="Smoothness  @Full-res")
@@ -615,7 +638,7 @@ def get_args():
     p.add_argument("--sim_sample_k", type=int,   default=1024)  # (호환성 유지)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=0.3)
+    p.add_argument("--vert_up_allow",   type=float, default=0.4)
     p.add_argument("--vert_down_allow", type=float, default=0.3)
     p.add_argument("--horiz_margin",    type=float, default=0.0)
     p.add_argument("--lambda_v",     type=float, default=1.0)
