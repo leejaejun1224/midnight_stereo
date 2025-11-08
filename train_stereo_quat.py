@@ -594,7 +594,6 @@ def get_args():
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--amp",        type=bool, default=True)
     p.add_argument("--seed",       type=int, default=42)
-
     # 손실 가중치
     p.add_argument("--w_dir",              type=float, default=1.0)
     p.add_argument("--w_reproj",           type=float, default=0.0)
