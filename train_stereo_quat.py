@@ -507,7 +507,7 @@ def train(args):
 
                             extra_eval = (
                                 f" || [Disp(px)] EPE={_get(disp_metrics,'EPE')}  D1={_get(disp_metrics,'D1_all','{:.2f}')}%  "
-                                f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2 px','{:.2f}')}%  "
+                                f">1px={_get(disp_metrics,'> 1px','{:.2f}')}%  >2px={_get(disp_metrics,'> 2px','{:.2f}')}%  "
                                 f"[Depth@1/4] AbsRel={_get(depth_metrics,'AbsRel')}  RMSE={_get(depth_metrics,'RMSE')}  "
                                 f"δ1={_get(depth_metrics,'δ<1.25')}"
                             )
