@@ -563,7 +563,7 @@ def train(args):
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
                       f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
-                      f"distill={float(distill_loss):.4f} "
+                      f"distill={float(distill_loss):.4f} , roi_l1={float(loss_roi_l1):.4f}, "
                       f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
                       f"photoF={float(loss_photo_full):.4f}, smoothF={float(loss_smooth_full):.4f})"
                       f"{extra_eval}")
@@ -632,7 +632,7 @@ def get_args():
 
     # 학습
     p.add_argument("--epochs",     type=int, default=4)
-    p.add_argument("--decay_epoch", type=int, default=2)
+    p.add_argument("--decay_epoch", type=int, default=4)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
@@ -641,8 +641,8 @@ def get_args():
     p.add_argument("--seed",       type=int, default=42)
 
     # 손실 가중치
-    p.add_argument("--w_dir",              type=float, default=1.0)
-    p.add_argument("--w_reproj",           type=float, default=1.0)
+    p.add_argument("--w_dir",              type=float, default=.0)
+    p.add_argument("--w_reproj",           type=float, default=.0)
     p.add_argument("--w_distill",          type=float, default=0.0)
     p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
@@ -658,9 +658,9 @@ def get_args():
     p.add_argument("--sim_sample_k", type=int,   default=1024)
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
-    p.add_argument("--vert_up_allow",   type=float, default=0.4)
-    p.add_argument("--vert_down_allow", type=float, default=0.4)
-    p.add_argument("--horiz_margin",    type=float, default=0.0)
+    p.add_argument("--vert_up_allow",   type=float, default=1.0)
+    p.add_argument("--vert_down_allow", type=float, default=1.0)
+    p.add_argument("--horiz_margin",    type=float, default=0.5)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
     p.add_argument("--huber_delta_h", type=float, default=1.0)

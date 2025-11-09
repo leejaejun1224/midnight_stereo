@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 # =========================
 # (환경에 맞게 경로 조정)
 # =========================
-from vit_cn import StereoModel
+# from vit_cn import StereoModel
+from vit_cn_L import StereoModel
 from agg.aggregator import SOTAStereoDecoder
 
 from tools import (
@@ -116,7 +117,7 @@ def save_colormap_png_with_colorbar(
     _ensure_dir(os.path.dirname(path))
     arr = np.array(np_array, dtype=np.float32)
 
-    # 범위 설정
+    # 범위 설정(에러맵 전용: vmin=0 고정, vmax는 99th percentile)
     finite_mask = np.isfinite(arr)
     vmin = 0.0
     if not finite_mask.any():
@@ -155,6 +156,62 @@ def save_colormap_png_with_colorbar(
 
     plt.tight_layout(pad=0.1)
     # ✅ 저장 시 facecolor 강제 반영
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.1, facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+def save_colormap_png_with_colorbar_auto_range(
+    path,
+    np_array,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap_name: str = "magma",
+    label: str = "",
+    bg_color: str = "#1e1e1e",
+):
+    """
+    일반 수치맵(예: disparity)용 컬러 PNG 저장 + colorbar.
+    - vmin/vmax 미지정 시 데이터의 finite min/max로 자동 설정(이상치 배제 안 함).
+    - NaN/invalid은 배경색으로 렌더.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, to_rgba
+
+    _ensure_dir(os.path.dirname(path))
+    arr = np.array(np_array, dtype=np.float32)
+    finite_mask = np.isfinite(arr)
+
+    if not finite_mask.any():
+        vmin_eff = 0.0 if (vmin is None) else float(vmin)
+        vmax_eff = 1.0 if (vmax is None) else float(vmax)
+    else:
+        vmin_eff = float(np.nanmin(arr[finite_mask])) if (vmin is None) else float(vmin)
+        vmax_eff = float(np.nanmax(arr[finite_mask])) if (vmax is None) else float(vmax)
+        vmax_eff = max(vmax_eff, vmin_eff + 1e-6)
+
+    import numpy as _np
+    base_cmap = plt.get_cmap(cmap_name)
+    from matplotlib.colors import ListedColormap, to_rgba
+    cmap = ListedColormap(base_cmap(_np.linspace(0, 1, 256)))
+    cmap.set_bad(to_rgba(bg_color))  # NaN → 배경색
+
+    H, W = arr.shape
+    dpi = 200.0
+    figsize = (W / dpi, H / dpi)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor(bg_color)
+    ax.set_facecolor(bg_color)
+
+    im = ax.imshow(arr, cmap=cmap, vmin=vmin_eff, vmax=vmax_eff)
+    ax.axis("off")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if label:
+        cbar.set_label(label, rotation=270, labelpad=12)
+
+    plt.tight_layout(pad=0.1)
     fig.savefig(path, bbox_inches="tight", pad_inches=0.1, facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -563,18 +620,33 @@ def run_inference(args):
                 elif args.overlay_always:
                     text_overlay = "EPE/D1 : N/A"
 
-                # disparity full-res(px)
+                # disparity 시각화 저장
                 if args.save_color:
                     # 1/4 해상도(px) 보조 시각화
-                    p2 = os.path.join(out_disp_qpx_px, f"{stem}_disp_1_4_px.png")
-                    save_colormap_png(p2, disp_q_full_px_np, vmax=args.vmax)
+                    p2_q = os.path.join(out_disp_qpx_px, f"{stem}_disp_1_4_px.png")
+                    save_colormap_png(p2_q, disp_q_full_px_np, vmax=args.vmax)
                     if text_overlay_q:
-                        annotate_png_top_left(p2, text_overlay_q)
+                        annotate_png_top_left(p2_q, text_overlay_q)
 
-                    p2 = os.path.join(out_disp_full_px, f"{stem}_disp_px.png")
-                    save_colormap_png(p2, disp_full_px_np, vmax=args.vmax)
+                    # full-res(px) 기본 컬러맵
+                    # p2 = os.path.join(out_disp_full_px, f"{stem}_disp_px.png")
+                    # save_colormap_png(p2, disp_full_px_np, vmax=args.vmax)
+                    # if text_overlay:
+                    #     annotate_png_top_left(p2, text_overlay)
+
+                    # === NEW: full-res(px) + colorbar 버전 추가 저장 ===
+                    p2_cb = os.path.join(out_disp_full_px, f"{stem}_disp_px_cb.png")
+                    save_colormap_png_with_colorbar_auto_range(
+                        p2_cb,
+                        disp_full_px_np,
+                        vmin=None,                      # 데이터 min 자동
+                        vmax=args.vmax,                 # 사용자가 지정하면 적용
+                        cmap_name=args.disp_cmap,
+                        label="Disparity (px)",
+                        bg_color=args.disp_bg_color
+                    )
                     if text_overlay:
-                        annotate_png_top_left(p2, text_overlay)
+                        annotate_png_top_left(p2_cb, text_overlay)
 
                 # === NEW: disparity gradient 시각화 저장 ===
                 if args.save_color and args.save_disp_grads:
@@ -620,15 +692,13 @@ def run_inference(args):
                     # EPE map (px) — FULL RES 직접 계산
                     epe_map_full = torch.abs(disp_full_px[bi:bi+1] - gt_disp_full_px) * valid_full  # [1,1,H,W]
 
-                    # numpy 변환 + invalid=NaN 처리(EPE)
+                    # numpy 변환
                     epe_map_full_np  = epe_map_full.squeeze(0).squeeze(0).detach().cpu().numpy()
-                    valid_full_np    = valid_full.squeeze(0).squeeze(0).detach().cpu().numpy().astype(bool)
-                    # epe_map_full_np[~valid_full_np] = np.nan  # NaN은 함수에서 배경색으로 채움
 
                     if args.save_npy:
                         save_npy(os.path.join(out_vis, f"{stem}_err_epe_full_px.npy"), epe_map_full_np)
 
-                    # === 요청 기능 — {stem}_error map.png 저장(오른쪽 color bar, 진한 배경) ===
+                    # === error map + colorbar 저장(진한 배경) ===
                     if args.save_color:
                         vmax_err = args.vmax_err if (args.vmax_err is not None and args.vmax_err > 0) else None
                         p_err_full_png = os.path.join(out_error, f"{stem}_error map.png")
@@ -673,13 +743,13 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
 
     # 모델/디코더 (학습과 동일하게 맞춰야 정확)
-    p.add_argument("--max_disp_px", type=int, default=60)
-    p.add_argument("--fused_ch",    type=int, default=320)
+    p.add_argument("--max_disp_px", type=int, default=56)
+    p.add_argument("--fused_ch",    type=int, default=512)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
-    p.add_argument("--local_radius", type=int, default=8)
+    p.add_argument("--local_radius", type=int, default=0)
 
     # 실행
     p.add_argument("--ckpt",       type=str, required=True, help="학습에서 저장한 .pth")
@@ -723,6 +793,12 @@ def get_args():
                    help="에러맵 배경색 (예: '#1e1e1e', 'black', '#f0f0f0')")
     p.add_argument("--err_cmap", type=str, default="magma",
                    help="에러맵 컬러맵 이름(예: 'magma', 'inferno', 'viridis', 'plasma')")
+
+    # --- NEW: disparity 컬러바 시각화 옵션 ---
+    p.add_argument("--disp_bg_color", type=str, default="#1e1e1e",
+                   help="disparity 컬러맵 배경색(유효하지 않은 픽셀 표현)")
+    p.add_argument("--disp_cmap", type=str, default="magma",
+                   help="disparity 컬러맵 이름(예: 'magma', 'inferno', 'viridis', 'plasma')")
 
     return p.parse_args()
 

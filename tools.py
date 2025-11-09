@@ -15,7 +15,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from PIL import Image
-
+from imageio import imread
 
 # =========================
 # Basic utils
@@ -586,13 +586,14 @@ def load_ms2_gt_depth_batch(names: List[str], gt_depth_dir: str, scale: float,
         if p.endswith(".npy"):
             arr = np.load(p).astype(np.float32)
         else:
-            arr = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-            if arr is None:
-                raise FileNotFoundError(f"[GT] failed to read: {p}")
-            if arr.ndim == 3:
-                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-            arr = arr.astype(np.float32)
-            arr = arr / max(scale, 1e-6)  # PNG는 depth[m]*scale
+            arr = np.array(imread(p).astype(np.float32)) / 256.0
+        #     arr = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        #     if arr is None:
+        #         raise FileNotFoundError(f"[GT] failed to read: {p}")
+        #     if arr.ndim == 3:
+        #         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        #     arr = arr.astype(np.float32)
+        #     arr = arr / max(scale, 1e-6)  # PNG는 depth[m]*scale
         if arr.shape != (Ht,Wt):
             arr = cv2.resize(arr, (Wt,Ht), interpolation=cv2.INTER_NEAREST)
         outs.append(torch.from_numpy(arr)[None,None])  # [1,1,H,W]

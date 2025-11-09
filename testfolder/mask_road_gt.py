@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+import os
+import math
+import argparse
+from pathlib import Path
+from typing import Optional, Tuple, Dict
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+# 백엔드 없이 저장만
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # roi_entropy_fill_and_viz.py
 # -*- coding: utf-8 -*-
 import argparse
@@ -948,3 +966,412 @@ def pad_right_bottom_to_multiple(img_pil: Image.Image, mult: int = 8) -> Image.I
 
 # if __name__ == "__main__":
 #     main()
+
+def _parse_invalid_values(s: str):
+    return [int(v) for v in s.split(",") if v.strip()!=""]
+
+# -----------------------------
+# 유틸: GT depth 로딩/리사이즈/변환
+# -----------------------------
+def _load_depth_any(depth_path: Path, scale: float = 256.0) -> np.ndarray:
+    """
+    depth 파일 로딩:
+      - .png / .tif(f) : raw / scale → m
+      - .npy           : 이미 m 단위라면 그대로, raw라면 scale로 나눠주세요
+      - .npz           : 'depth' 키 우선, 없으면 첫 배열
+    반환: float32 [H,W] (m)
+    """
+    ext = depth_path.suffix.lower()
+    if ext in [".png", ".tif", ".tiff"]:
+        arr = np.array(Image.open(str(depth_path)))
+        arr = arr.astype(np.float32) / float(scale)
+        return arr
+    elif ext == ".npy":
+        arr = np.load(str(depth_path))
+        arr = arr.astype(np.float32)
+        return arr
+    elif ext == ".npz":
+        data = np.load(str(depth_path))
+        if "depth" in data:
+            arr = data["depth"].astype(np.float32)
+        else:
+            # 첫 키
+            k0 = list(data.keys())[0]
+            arr = data[k0].astype(np.float32)
+        return arr
+    else:
+        raise ValueError(f"Unsupported depth file: {depth_path}")
+
+def _resize_depth_nearest(depth_m: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
+    Ht, Wt = target_hw
+    if depth_m.shape[0] == Ht and depth_m.shape[1] == Wt:
+        return depth_m
+    # 깊이의 스케일 보존을 위해 nearest 권장
+    return np.array(Image.fromarray(depth_m).resize((Wt, Ht), resample=Image.NEAREST))
+
+def depth_to_disp_px(depth_m: np.ndarray, focal_px: float, baseline_m: float) -> np.ndarray:
+    disp = (focal_px * baseline_m) / np.clip(depth_m, 1e-6, None)
+    # depth==0 → disp=nan 으로 처리
+    disp[~np.isfinite(disp)] = np.nan
+    disp[depth_m <= 0] = np.nan
+    return disp.astype(np.float32)
+
+# -----------------------------
+# 정량지표
+# -----------------------------
+def compute_disp_metrics(pred_px: np.ndarray, gt_px: np.ndarray, mask: np.ndarray) -> Optional[Dict[str, float]]:
+    """
+    pred_px, gt_px: [H,W] (px), NaN 허용
+    mask: bool [H,W] (유효영역 제한; 예: fill-mask 업샘플)
+    """
+    valid = np.isfinite(pred_px) & np.isfinite(gt_px) & (gt_px > 0) & mask
+    if valid.sum() == 0:
+        return None
+    err = np.abs(pred_px - gt_px)
+    e   = err[valid]
+    g   = gt_px[valid]
+    EPE = float(e.mean())
+    gt1 = float((e > 1.0).mean() * 100.0)
+    gt2 = float((e > 2.0).mean() * 100.0)
+    D1  = float((e > np.maximum(3.0, 0.05 * g)).mean() * 100.0)  # KITTI-style
+    return {"EPE": EPE, "D1_all": D1, ">1px": gt1, ">2px": gt2, "Npix": int(valid.sum())}
+
+def fmt_metrics(m: Optional[Dict[str, float]]) -> str:
+    if not m: return "N/A"
+    return (f"EPE={m['EPE']:.3f} | D1={m['D1_all']:.2f}% | "
+            f">1px={m['>1px']:.2f}% | >2px={m['>2px']:.2f}% | N={m['Npix']}")
+def load_gt_disp_px(gt_path, mode, depth_scale, disp_scale, focal_px, baseline_m,
+                    target_hw, invalid_values=(0,65535), max_depth_m=200.0):
+    raw = np.array(Image.open(str(gt_path))).astype(np.float32)  # raw 그대로
+    raw = _resize_depth_nearest(raw, target_hw)
+
+    # 1) 무효 마스크 (센티널)
+    inv = np.zeros_like(raw, dtype=bool)
+    if invalid_values:
+        for v in invalid_values:
+            inv |= (raw == float(v))
+
+    if mode == "depth":
+        depth_m = raw / float(depth_scale)
+        # 2) 비현실 큰 깊이도 무효(센티널 필터 못잡은 경우 보호장치)
+        if max_depth_m > 0:
+            inv |= (depth_m > float(max_depth_m))
+        inv |= ~np.isfinite(depth_m) | (depth_m <= 0)
+        depth_m[inv] = np.nan
+        disp_px = (focal_px * baseline_m) / np.clip(depth_m, 1e-6, None)
+        disp_px[~np.isfinite(disp_px)] = np.nan
+    else:  # "disp"
+        disp_px = raw / float(disp_scale)
+        inv |= ~np.isfinite(disp_px) | (disp_px <= 0)
+        disp_px[inv] = np.nan
+
+    return disp_px.astype(np.float32)
+
+# -----------------------------
+# 시각화 묶음 (Pred vs GT)
+# -----------------------------
+def visualize_pred_vs_gt(
+    left_img_pil: Image.Image,
+    disp_pred_cell: np.ndarray,   # [H4,W4] in 1/4-cell units
+    fill_mask_q: np.ndarray,      # [H4,W4] bool (ROI∩invalid)
+    disp_gt_px_full: np.ndarray,  # [H,W] in px
+    max_disp_cell: int,
+    save_path: Path,
+    title: str = ""
+):
+    """
+    다섯 패널:
+      (1) Left + Pred(채운 부분만) overlay
+      (2) Left + GT overlay
+      (3) Pred disparity (full, px)
+      (4) GT disparity (px)
+      (5) |Pred−GT| (px) — 채운 부분만
+    """
+    img_np = np.asarray(left_img_pil)
+
+    # Pred @ full-res(px) + Fill-mask 업샘플
+    disp_pred_px_full = upsample_nearest_4x(disp_pred_cell).astype(np.float32) * 4.0  # [H,W]
+    mask_full = upsample_nearest_4x(fill_mask_q.astype(np.uint8)).astype(bool)        # [H,W]
+
+    # 컬러맵/스케일
+    vmax_px = float(max_disp_cell * 4)
+    cmap_disp = _get_transparent_disp_cmap()
+
+    # (A) overlay용: 채운 부분만 가시화
+    pred_vis = np.where(mask_full, disp_pred_px_full, np.nan)
+    gt_vis   = np.where(np.isfinite(disp_gt_px_full), disp_gt_px_full, np.nan)
+
+    # 에러 (채운 부분만)
+    err = np.abs(disp_pred_px_full - disp_gt_px_full)
+    err_vis = np.where(mask_full & np.isfinite(err), err, np.nan)
+
+    # 정량 — 채운 부분 마스크 기준
+    metrics_filled = compute_disp_metrics(disp_pred_px_full, disp_gt_px_full, mask_full)
+    # 전체 유효 GT (참고)
+    metrics_all    = compute_disp_metrics(disp_pred_px_full, disp_gt_px_full, np.isfinite(disp_gt_px_full))
+
+    # ---- 그리기 ----
+    fig, axes = plt.subplots(1, 5, figsize=(5*5.6, 5.6))
+    axes = np.ravel(axes).tolist()
+    if title:
+        fig.suptitle(title, fontsize=12)
+
+    # (1) Left + Pred(채운 부분) overlay
+    ax = axes[0]
+    ax.imshow(img_np)
+    im = ax.imshow(pred_vis, vmin=0, vmax=vmax_px, alpha=0.55, cmap=cmap_disp)
+    ax.set_title("Pred (filled region only)")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("disparity [px]")
+
+    # (2) Left + GT overlay
+    ax = axes[1]
+    ax.imshow(img_np)
+    im = ax.imshow(gt_vis, vmin=0, vmax=vmax_px, alpha=0.55, cmap=cmap_disp)
+    ax.set_title("GT disparity")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("disparity [px]")
+
+    # (3) Pred disparity (px, full)
+    ax = axes[2]
+    im = ax.imshow(disp_pred_px_full, vmin=0, vmax=vmax_px, cmap=cmap_disp)
+    ax.set_title("Pred (px, full)")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("disparity [px]")
+
+    # (4) GT disparity (px)
+    ax = axes[3]
+    im = ax.imshow(disp_gt_px_full, vmin=0, vmax=vmax_px, cmap=cmap_disp)
+    ax.set_title("GT (px)")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("disparity [px]")
+
+    # (5) |Pred-GT| (px) — filled만
+    ax = axes[4]
+    vmax_err = max(5.0, min(20.0, vmax_px/6.0))  # 보기 좋은 범위
+    im = ax.imshow(err_vis, vmin=0, vmax=vmax_err, cmap="magma")
+    ax.set_title("|Pred−GT| on filled region")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("absolute error [px]")
+
+    # 하단 텍스트: metrics
+    txt = (f"[Filled] {fmt_metrics(metrics_filled)}\n"
+           f"[All-Valid] {fmt_metrics(metrics_all)}")
+    fig.text(0.5, 0.02, txt, ha="center", va="bottom", fontsize=10)
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    fig.savefig(str(save_path), dpi=150)
+    plt.close(fig)
+    print(f"[Saved] {save_path}")
+
+# -----------------------------
+# DINO 기반 채움 + GT 비교 파이프라인
+# -----------------------------
+def process_pair_and_viz(
+    model,
+    left_pil: Image.Image, right_pil: Image.Image, stem: str,
+    args
+):
+    # --- 패딩(옵션) ---
+    if args.pad_to_8:
+        Lp = pad_right_bottom_to_multiple(left_pil,  mult=8)
+        Rp = pad_right_bottom_to_multiple(right_pil, mult=8)
+    else:
+        Lp, Rp = left_pil, right_pil
+
+    W, H = Lp.size
+    assert (H % 8 == 0) and (W % 8 == 0), "H,W must be multiples of 8. Use --pad_to_8."
+
+    # --- 텐서 변환 ---
+    xL = pil_to_tensor(Lp)  # [1,3,H,W] (ImageNet 정규화)
+    xR = pil_to_tensor(Rp)
+
+    with torch.no_grad():
+        # 1/4 특징
+        featL = build_quarter_features(model, xL)  # [H4,W4,C]
+        featR = build_quarter_features(model, xR)
+
+        # 코스트볼륨 & 엔트로피(before)
+        cost_vol = build_cost_volume(featL, featR, args.max_disp)
+        ent_before = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)
+
+        # ROI
+        _, H4, W4 = cost_vol.shape
+        roi_mask = build_roi_mask(
+            H4, W4, args.roi_mode,
+            args.roi_u0, args.roi_u1, args.roi_v0, args.roi_v1,
+            device=ent_before.device
+        )
+
+        # Adaptive window refine (ROI∩invalid만 보정)
+        cost_vol_ref, ent_after, refine_mask = refine_cost_for_uncertain_roi(
+            cost_vol, ent_before, ent_thr=args.ent_vis_thr,
+            roi_mask=roi_mask, max_half=args.win_half_max, ent_T=args.ent_T
+        )
+
+        # base/teacher disparity (cell units)
+        disp_base_cell, _   = argmax_disparity(cost_vol)        # [H4,W4] long
+        disp_teacher_cell, _ = argmax_disparity(cost_vol_ref)   # [H4,W4] long
+
+    # ---- FILL: ROI∩invalid만 teacher로 덮어쓰기 ----
+    fill_mask = refine_mask  # ROI ∩ invalid
+    disp_base_cell = disp_base_cell.to(torch.float32)
+    disp_teacher_cell = disp_teacher_cell.to(torch.float32)
+    disp_filled_cell = disp_base_cell.clone()
+    disp_filled_cell[fill_mask] = disp_teacher_cell[fill_mask]
+
+    # numpy로 변환
+    disp_filled_np = disp_filled_cell.cpu().numpy().astype(np.float32)
+    fill_mask_np   = fill_mask.cpu().numpy().astype(bool)
+
+    # ---- GT depth → disparity(px) ----
+    # depth 파일 찾기
+    depth_path = find_depth_for_left(Path(args.gt_depth_dir), stem)
+    if depth_path is None:
+        print(f"[Skip] GT depth not found for {stem}")
+        return
+
+    invalid_vals = _parse_invalid_values(args.gt_invalid_values)
+    disp_gt_px = load_gt_disp_px(
+        depth_path,
+        mode=args.gt_mode,
+        depth_scale=args.gt_depth_scale,
+        disp_scale=args.gt_disp_scale,
+        focal_px=args.focal_px,
+        baseline_m=args.baseline_m,
+        target_hw=(H, W),
+        invalid_values=invalid_vals,
+        max_depth_m=args.gt_max_depth_m,
+    )
+
+    # ---- 시각화 저장 ----
+    out_png = Path(args.out_dir) / "cmp" / f"{stem}.png"
+    visualize_pred_vs_gt(
+        left_img_pil=Lp,
+        disp_pred_cell=disp_filled_np,
+        fill_mask_q=fill_mask_np,
+        disp_gt_px_full=disp_gt_px,
+        max_disp_cell=args.max_disp,
+        save_path=out_png,
+        title=f"{stem} | ROI-fill vs GT"
+    )
+
+def find_right_for_left(right_dir: Path, left_stem: str) -> Optional[Path]:
+    for ext in IMG_EXTS:
+        cand = right_dir / f"{left_stem}{ext}"
+        if cand.exists(): return cand
+    return None
+
+def find_depth_for_left(gt_depth_dir: Path, left_stem: str) -> Optional[Path]:
+    exts = [".png", ".tif", ".tiff", ".npy", ".npz"]
+    for ext in exts:
+        cand = gt_depth_dir / f"{left_stem}{ext}"
+        if cand.exists(): return cand
+    return None
+
+# -----------------------------
+# CLI
+# -----------------------------
+def get_args():
+    p = argparse.ArgumentParser("ROI entropy fill result vs GT disparity — visualization")
+    # 입력(단일/디렉터리)
+    p.add_argument("--left",  type=str, default=None)
+    p.add_argument("--right", type=str, default=None)
+    p.add_argument("--left_dir",  type=str, default="/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_left")
+    p.add_argument("--right_dir", type=str, default="/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_right")
+    p.add_argument("--glob", type=str, default="*.png")
+
+    # DINO/코스트볼륨
+    p.add_argument("--max_disp", type=int, default=14, help="1/4-grid max disparity (inclusive)")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--pad_to_8", action="store_true")
+
+    # 엔트로피/ROI 파라미터 (기본값: 학습 코드와 동일 계열)
+    p.add_argument("--ent_T", type=float, default=0.1)
+    p.add_argument("--ent_vis_thr", type=float, default=0.8)
+    p.add_argument("--roi_mode", type=str, default="frac", choices=["frac","abs4"])
+    p.add_argument("--roi_u0", type=float, default=0.3)
+    p.add_argument("--roi_u1", type=float, default=0.7)
+    p.add_argument("--roi_v0", type=float, default=2/3)
+    p.add_argument("--roi_v1", type=float, default=1.0)
+    p.add_argument("--win_half_max", type=int, default=12)
+
+    # GT/캘리브 (학습 코드 기본값 참고)
+    p.add_argument("--gt_depth_dir",  type=str, default="/home/jaejun/dataset/MS2/proj_depth/tester/rgb/depth_filtered")
+    p.add_argument("--gt_depth_scale", type=float, default=256.0)
+    p.add_argument("--focal_px", type=float, default=764.5138549804688)
+    p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
+
+    # 출력
+    p.add_argument("--out_dir", type=str, default="./log/out_fill_vs_gt")
+    p.add_argument("--gt_mode", type=str, default="depth", choices=["depth","disp"])
+    # p.add_argument("--gt_depth_scale", type=float, default=256.0)
+    p.add_argument("--gt_disp_scale",  type=float, default=1.0)
+    p.add_argument("--gt_invalid_values", type=str, default="0,65535",
+                help="raw GT에서 무효로 볼 값들(쉼표 구분). 예: 0,65535")
+    p.add_argument("--gt_max_depth_m", type=float, default=200.0,
+                help="이 값보다 큰 깊이는 무효 처리(센티널/오류 방지). 0이면 비활성")
+
+    return p.parse_args()
+
+def main():
+    args = get_args()
+    device = torch.device(args.device)
+
+    # 모드 판별
+    dir_mode = (args.left is None and args.right is None and args.left_dir and args.right_dir)
+    file_mode = (args.left is not None and args.right is not None)
+    assert dir_mode or file_mode, "하나를 선택: (1) --left/--right 또는 (2) --left_dir/--right_dir"
+
+    # DINO 로드
+    model = load_dino(device)
+
+    if file_mode:
+        lp = Path(args.left); rp = Path(args.right)
+        assert lp.exists(), f"Not found: {lp}"
+        assert rp.exists(), f"Not found: {rp}"
+        L = Image.open(str(lp)).convert("RGB")
+        R = Image.open(str(rp)).convert("RGB")
+        assert L.size == R.size, f"size mismatch: {L.size} vs {R.size}"
+        process_pair_and_viz(model, L, R, lp.stem, args)
+        return
+
+    # 디렉터리 모드
+    left_dir  = Path(args.left_dir);  right_dir = Path(args.right_dir)
+    out_dir   = Path(args.out_dir)
+    assert left_dir.is_dir() and right_dir.is_dir(), "입력 디렉터리 확인"
+    Path(args.gt_depth_dir).mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    left_files = sorted(left_dir.glob(args.glob))
+    assert len(left_files) > 0, f"No files matching {args.glob} in {left_dir}"
+
+    processed, skipped = 0, 0
+    for lp in left_files:
+        rp = find_right_for_left(right_dir, lp.stem)
+        if rp is None:
+            print(f"[Skip] right not found for {lp.name}"); skipped += 1; continue
+        depth_path = find_depth_for_left(Path(args.gt_depth_dir), lp.stem)
+        if depth_path is None:
+            print(f"[Skip] gt depth not found for {lp.name}"); skipped += 1; continue
+        try:
+            L = Image.open(str(lp)).convert("RGB")
+            R = Image.open(str(rp)).convert("RGB")
+            if L.size != R.size:
+                print(f"[Skip] size mismatch: {lp.name} vs {rp.name}"); skipped += 1; continue
+            process_pair_and_viz(model, L, R, lp.stem, args)
+            processed += 1
+        except Exception as e:
+            print(f"[Error] {lp.name}: {e}")
+            skipped += 1
+
+    print(f"[Done] processed={processed}, skipped={skipped}, out_dir={out_dir.resolve()}")
+
+if __name__ == "__main__":
+    main()
