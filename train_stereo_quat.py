@@ -13,7 +13,8 @@ from logger import save_args_as_text
 # =========================
 # (환경에 맞게 경로 조정)
 # =========================
-from vit_cn import StereoModel
+# from vit_cn import StereoModel
+from vit_cn_L import StereoModel
 from agg.aggregator import SOTAStereoDecoder
 from agg.decoder_selective_igev import IGEVStereo
 from logger import save_args_txt_dynamic
@@ -264,6 +265,7 @@ def train(args):
     stereo = StereoModel(
         freeze_vit=True,
         amp=args.amp,
+        cf=args.fused_ch,
         autopad_to_8=False,   # << 입력은 외부에서 16배수 패딩
     ).to(device).train()
 
@@ -305,6 +307,7 @@ def train(args):
             weight_gamma=0.5, weight_delta=1.0,
             gap_min=1.0, gap_norm=4.0, L0=8.0
         ).to(device)
+    
     roi_l1_crit = ROIEntropySmoothL1Loss(
         max_disp=int(args.max_disp_px // 4),      # 1/4 그리드 단위
         roi_mode=args.roi_mode,
@@ -610,12 +613,12 @@ def get_args():
 
     # 모델/디코더
     p.add_argument("--max_disp_px", type=int, default=56)
-    p.add_argument("--fused_ch",    type=int, default=320)
+    p.add_argument("--fused_ch",    type=int, default=512)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
-    p.add_argument("--local_radius", type=int, default=8)
+    p.add_argument("--local_radius", type=int, default=0)
 
     # (IGE V params — 보유 시)
     p.add_argument("--hidden_dims", default=[128, 128, 128])
@@ -628,8 +631,8 @@ def get_args():
     p.add_argument("--igev_iters",type=int, default=16)
 
     # 학습
-    p.add_argument("--epochs",     type=int, default=20)
-    p.add_argument("--decay_epoch", type=int, default=10)
+    p.add_argument("--epochs",     type=int, default=4)
+    p.add_argument("--decay_epoch", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
@@ -644,7 +647,7 @@ def get_args():
     p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.1,   help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.01,   help="Smoothness  @Full-res")
 
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
@@ -656,14 +659,14 @@ def get_args():
     p.add_argument("--use_dynamic_thr", action="store_true")
     p.add_argument("--dynamic_q",    type=float, default=0.7)
     p.add_argument("--vert_up_allow",   type=float, default=0.4)
-    p.add_argument("--vert_down_allow", type=float, default=0.3)
+    p.add_argument("--vert_down_allow", type=float, default=0.4)
     p.add_argument("--horiz_margin",    type=float, default=0.0)
     p.add_argument("--lambda_v",     type=float, default=1.0)
     p.add_argument("--lambda_h",     type=float, default=1.0)
     p.add_argument("--huber_delta_h", type=float, default=1.0)
 
     # --- ROIEntropySmoothL1Loss 하이퍼 ---
-    p.add_argument("--w_roi_l1",        type=float, default=0.5,  help="가중치: ROIEntropySmoothL1Loss")
+    p.add_argument("--w_roi_l1",        type=float, default=1.0,  help="가중치: ROIEntropySmoothL1Loss")
     p.add_argument("--roi_mode",        type=str,   default="frac", choices=["frac","abs4"])
     p.add_argument("--roi_u0",          type=float, default=0.3)
     p.add_argument("--roi_u1",          type=float, default=0.7)
