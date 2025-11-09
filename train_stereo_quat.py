@@ -15,7 +15,8 @@ from logger import save_args_as_text
 # =========================
 # from vit_cn import StereoModel
 from vit_cn_L import StereoModel
-from agg.aggregator import SOTAStereoDecoder
+# from agg.aggregator import SOTAStereoDecoder
+from agg.aggregator_plus import SOTAStereoDecoder
 from agg.decoder_selective_igev import IGEVStereo
 from logger import save_args_txt_dynamic
 
@@ -631,8 +632,8 @@ def get_args():
     p.add_argument("--igev_iters",type=int, default=16)
 
     # 학습
-    p.add_argument("--epochs",     type=int, default=4)
-    p.add_argument("--decay_epoch", type=int, default=4)
+    p.add_argument("--epochs",     type=int, default=20)
+    p.add_argument("--decay_epoch", type=int, default=11)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
