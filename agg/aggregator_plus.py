@@ -1,0 +1,633 @@
+# decoder_sota.py
+# -*- coding: utf-8 -*-
+"""
+SOTA-지향 Stereo Decoder:
+- 1/4 cos-sim correlation volume  (from StereoModel['cossim_feat_1_4'])
+- 1/4 concat volume (from StereoModel['fused_1_4'], channel-reduced)
+- ACV attention (corr -> 3D conv -> weights -> weight * concat volume)  [ACVNet, TPAMI'24]
+- (opt) MCCV-style motif gating to emphasize edge/structure correlation   [MoCha-Stereo, CVPR'24]
+- 3D hourglass aggregation -> soft-argmin disparity at 1/4
+- (opt) 2-stage: local-range refine around coarse disparity (IGEV++ spirit)
+- upsample x4 + light 2D refine -> full-res disparity
+
+Inputs:
+  backbone_out = StereoModel.forward(...)
+"""
+
+from typing import Dict, Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------
+# utils
+# ---------------------------
+def soft_argmin(prob: torch.Tensor) -> torch.Tensor:
+    B, D, H, W = prob.shape
+    disp_values = torch.arange(D, device=prob.device, dtype=prob.dtype).view(1, D, 1, 1)
+    return torch.sum(prob * disp_values, dim=1, keepdim=True)
+
+def entropy_map(prob: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    B, D, H, W = prob.shape
+    p = prob.clamp_min(eps)
+    ent = -(p * p.log()).sum(dim=1, keepdim=True) / (torch.log(torch.tensor(float(D), device=prob.device)) + eps)
+    return ent.clamp(0, 1)
+
+def _shift_right_feats(feat: torch.Tensor, d: int) -> torch.Tensor:
+    # shift right image to left by d cells (i.e., pad left by d)
+    if d == 0:
+        return feat
+    return F.pad(feat, (d, 0, 0, 0))[:, :, :, : feat.shape[-1]]
+
+def _down2(x: torch.Tensor) -> torch.Tensor:
+    return F.avg_pool2d(x, kernel_size=2, stride=2)
+
+
+# ---------------------------
+# 1) Correlation volume @ 1/4 (cosine)  [channel-last -> channel-first]
+# ---------------------------
+class CorrVolume1_4(nn.Module):
+    def __init__(self, max_disp_px: int):
+        super().__init__()
+        self.D = max(1, max_disp_px // 4)
+
+    def forward(self, L_corr: torch.Tensor, R_corr: torch.Tensor) -> torch.Tensor:
+        """
+        L_corr, R_corr: [B, H4, W4, C], L2-normalized
+        return: corr volume ~ cosine similarity → [B, D, H4, W4]
+        """
+        B, H4, W4, C = L_corr.shape
+        L = L_corr.permute(0, 3, 1, 2).contiguous()   # [B,C,H4,W4]
+        R = R_corr.permute(0, 3, 1, 2).contiguous()
+        vols = []
+        for d in range(self.D):
+            R_shift = _shift_right_feats(R, d)
+            sim = (L * R_shift).sum(dim=1, keepdim=False)  # [B,H4,W4]
+            vols.append(sim)
+        corr = torch.stack(vols, dim=1)  # [B,D,H4,W4]
+        return corr
+
+
+# ---------------------------
+# 2) Concat volume @ 1/4 with channel reduction  [ACV: concat + attention]
+# ---------------------------
+class ConcatVolume1_4(nn.Module):
+    def __init__(self, in_ch: int, red_ch: int = 48):
+        super().__init__()
+        self.reduce = nn.Conv2d(in_ch, red_ch, 1)  # compress fused_1_4 channels
+
+    def forward(self, L_fused: torch.Tensor, R_fused: torch.Tensor, D: int) -> torch.Tensor:
+        """
+        L_fused, R_fused: [B,Cf,H4,W4]  (channel-first)
+        return: concat volume [B, 2*Cr, D, H4, W4]
+        """
+        Lr = self.reduce(L_fused)
+        Rr = self.reduce(R_fused)
+        vols = []
+        for d in range(D):
+            R_shift = _shift_right_feats(Rr, d)
+            vols.append(torch.cat([Lr, R_shift], dim=1))  # [B,2*Cr,H4,W4]
+        vol = torch.stack(vols, dim=2)  # [B,2*Cr,D,H4,W4]
+        return vol, Lr.shape[1]  # Cr
+
+
+# ---------------------------
+# 3) ACV attention from corr volume  [ACVNet, TPAMI'24]
+#     corr[B, D, H, W] -> weights[B, 2*Cr, D, H, W]  (sigmoid)
+# ---------------------------
+class ACVAttention(nn.Module):
+    def __init__(self, out_ch: int, hidden: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(1, hidden, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv3d(hidden, out_ch, 3, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, corr: torch.Tensor) -> torch.Tensor:
+        x = corr.unsqueeze(1)          # [B,1,D,H,W]
+        w = self.net(x)                # [B,out_ch,D,H,W]
+        return w
+
+
+# ---------------------------
+# 4) (opt) MCCV-style motif gating  [MoCha-Stereo, CVPR'24]
+#     간단 projector로 motif 채널 생성 후, motif correlation로 채널 게이트 생성
+# ---------------------------
+class MotifProjector(nn.Module):
+    def __init__(self, in_ch: int, m_ch: int = 24):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_ch, m_ch, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(m_ch, m_ch, 3, 1, 1)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)  # [B,m,H,W]
+
+class MCCVGating(nn.Module):
+    def __init__(self, m_ch: int, out_ch: int):
+        super().__init__()
+        self.map = nn.Sequential(
+            nn.Conv3d(1, out_ch, 3, 1, 1),
+            nn.Sigmoid()
+        )
+        self.m_ch = m_ch
+
+    def forward(self, ML: torch.Tensor, MR: torch.Tensor, D: int) -> torch.Tensor:
+        """
+        ML, MR: motif features [B,m,H4,W4]
+        return: weights [B,out_ch,D,H4,W4]
+        """
+        B, m, H4, W4 = ML.shape
+        vols = []
+        for d in range(D):
+            MR_shift = _shift_right_feats(MR, d)
+            # motif correlation (cos-normalization for stability)
+            MLn = F.normalize(ML, dim=1)
+            MRn = F.normalize(MR_shift, dim=1)
+            sim = (MLn * MRn).sum(dim=1, keepdim=True)  # [B,1,H4,W4]
+            vols.append(sim)
+        mccv = torch.stack(vols, dim=2)  # [B,1,D,H4,W4]
+        return self.map(mccv)            # [B,out_ch,D,H4,W4]
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple
+
+# ---------- GN 블록 ----------
+class Conv3dGN(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, groups=8, act=True, bias=False):
+        super().__init__()
+        self.conv = nn.Conv3d(in_ch, out_ch, k, s, p, bias=bias)
+        self.gn   = nn.GroupNorm(groups, out_ch)
+        self.act  = nn.ReLU(inplace=True) if act else nn.Identity()
+    def forward(self, x):
+        return self.act(self.gn(self.conv(x)))
+
+class ResBlock3D_GN(nn.Module):
+    def __init__(self, ch, dilation: Tuple[int,int,int]=(1,1,1), groups=8):
+        super().__init__()
+        d = dilation
+        self.c1 = Conv3dGN(ch, ch, k=3, s=1, p=d, groups=groups, act=True,  bias=False)
+        self.c1.conv.dilation = d
+        self.c2 = Conv3dGN(ch, ch, k=3, s=1, p=d, groups=groups, act=False, bias=False)
+        self.c2.conv.dilation = d
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        y = self.c2(self.c1(x))
+        return self.act(x + y)
+
+class DMix3D(nn.Module):
+    """
+    D축 문맥 섞기(저비용). D만 1/2 내렸다 올려 문맥을 blend.
+    출력은 입력과 동일한 (D,H,W).
+    """
+    def __init__(self, ch, levels=1, groups=8):
+        super().__init__()
+        self.levels = levels
+        self.act = nn.ReLU(inplace=True)
+        self.downs, self.down_norms = nn.ModuleList(), nn.ModuleList()
+        self.ups,   self.up_norms   = nn.ModuleList(), nn.ModuleList()
+        for _ in range(levels):
+            self.downs.append(nn.Conv3d(ch, ch, kernel_size=(3,1,1), stride=(2,1,1),
+                                        padding=(1,0,0), bias=False))
+            self.down_norms.append(nn.GroupNorm(num_groups=min(8, ch), num_channels=ch))
+            self.ups.append(nn.ConvTranspose3d(ch, ch, kernel_size=(3,1,1), stride=(2,1,1),
+                                               padding=(1,0,0), bias=False))
+            self.up_norms.append(nn.GroupNorm(num_groups=min(8, ch), num_channels=ch))
+    def forward(self, x):
+        y = x
+        for i in range(self.levels):
+            z = self.act(self.down_norms[i](self.downs[i](y)))
+            z = self.ups[i](z, output_size=y.shape[-3:])  # (D,H,W) 정확 복원
+            z = self.act(self.up_norms[i](z))
+            y = y + z
+        return y
+
+
+# ---------- Hourglass: GN + D stride=1 (+정렬 보장) ----------
+class Hourglass3D_GN_D1_Align(nn.Module):
+    """
+    입력 : [B, Cin, D, H4, W4]   (예: Cin=2*Cr, D=48, H4=96, W4=306)
+    출력 : [B, D, H4, W4]        (logits)
+    설계 : D축 stride=1 유지, H/W만 1/2 다운. Up에서 output_size로 skip과 정확 정렬.
+    """
+    def __init__(self,
+                 in_ch: int,
+                 base: int = 32,
+                 gn_groups: int = 8,
+                 n_res_enc=(1,1),
+                 n_res_mid=2,
+                 n_res_dec=(1,1),
+                 use_dmix=True,
+                 logit_scale: float = 1.2):
+        super().__init__()
+        c, g = base, gn_groups
+
+        # Stem
+        self.stem = nn.Sequential(
+            Conv3dGN(in_ch, c, k=3, s=1, p=1, groups=g, act=True),
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_enc[0])]
+        )
+
+        # Down: D 고정, H/W만 1/2 (stride=(1,2,2))
+        self.down1 = nn.Sequential(
+            Conv3dGN(c, c, k=3, s=(1,2,2), p=1, groups=g, act=True),
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_enc[1])]
+        )
+        self.down2 = nn.Sequential(
+            Conv3dGN(c, 2*c, k=3, s=(1,2,2), p=1, groups=g, act=True)
+        )
+
+        # Mid: dilated + (opt) D-mix
+        mid_blocks = [ResBlock3D_GN(2*c, dilation=(1,1,1), groups=g)]
+        mid_blocks += [ResBlock3D_GN(2*c, dilation=(2,1,1), groups=g) for _ in range(max(0, n_res_mid-1))]
+        self.mid = nn.Sequential(*mid_blocks)
+        self.dmix = DMix3D(2*c, groups=g) if use_dmix else nn.Identity()
+
+        # Up: H/W ×2 (정렬 보장용 output_size 사용)
+        self.up1 = nn.ConvTranspose3d(2*c, c, kernel_size=(1,4,4),
+                                      stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.up1_gn = nn.GroupNorm(g, c)
+        self.up1_act= nn.ReLU(inplace=True)
+        self.dec1 = nn.Sequential(
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_dec[0])]
+        )
+
+        self.up2 = nn.ConvTranspose3d(c, c, kernel_size=(1,4,4),
+                                      stride=(1,2,2), padding=(0,1,1), bias=False)
+        self.up2_gn = nn.GroupNorm(g, c)
+        self.up2_act= nn.ReLU(inplace=True)
+        self.dec0 = nn.Sequential(
+            *[ResBlock3D_GN(c, dilation=(1,1,1), groups=g) for _ in range(n_res_dec[1])]
+        )
+
+        # Head
+        self.head = nn.Conv3d(c, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        nn.init.kaiming_normal_(self.head.weight, nonlinearity='linear')
+        with torch.no_grad():
+            self.head.weight.mul_(logit_scale)
+
+    def forward(self, x):
+        """
+        x: [B, Cin, D, 96, 306]   (예시)
+        """
+        B, Cin, D, H4, W4 = x.shape
+        # enc
+        x0 = self.stem(x)     # [B,c,  D, H4,     W4]   → [B, 32, D, 96, 306]
+        x1 = self.down1(x0)   # [B,c,  D, H4/2,   W4/2] → [B, 32, D, 48, 153]
+        x2 = self.down2(x1)   # [B,2c, D, H4/4,   W4/4] → [B, 64, D, 24, 77]
+
+        # mid
+        xm = self.mid(x2)     # [B, 64, D, 24, 77]
+        xm = self.dmix(xm)    # [B, 64, D, 24, 77]
+
+        # dec1 (정렬 보장)
+        y  = self.up1(xm, output_size=x1.shape[-3:])  # 목표: (D,48,153)
+        y  = self.up1_act(self.up1_gn(y))
+        assert y.shape[-3:] == x1.shape[-3:], f"up1 mismatch: {y.shape[-3:]} vs {x1.shape[-3:]}"
+        y  = y + x1
+        y  = self.dec1(y)
+
+        # dec0 (정렬 보장)
+        y  = self.up2(y, output_size=x0.shape[-3:])   # 목표: (D,96,306)
+        y  = self.up2_act(self.up2_gn(y))
+        assert y.shape[-3:] == x0.shape[-3:], f"up2 mismatch: {y.shape[-3:]} vs {x0.shape[-3:]}"
+        y  = y + x0
+        y  = self.dec0(y)
+
+        # logits [B, D, H4, W4]
+        return self.head(y).squeeze(1)
+
+class ConvexUpsampleX4(nn.Module):
+    """
+    RAFT/RAFT-Stereo 스타일 convex upsampler (×4).
+    한 픽셀을 주변 3x3 저해상도 disparity의 '볼록 조합'으로 예측.
+    - disp_q   : [B,1,h,w]
+    - fused_q  : [B,Cf,h,w]  (마스크 예측용 컨텍스트)
+    - 반환 disp : [B,1,4h,4w]
+    """
+    def __init__(self, cf: int = 256, k: int = 3, scale: int = 4, mid: int = 128):
+        super().__init__()
+        assert k == 3, "보통 3x3 패치를 씁니다(논문 관행)."
+        self.k = k
+        self.s = scale
+        kk = k * k
+        ss = scale * scale
+        # 간단한 2층 CNN으로 (s*s*9) 마스크 생성
+        self.mask_pred = nn.Sequential(
+            nn.Conv2d(cf,       mid, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid, ss * kk, 1, 1, 0)
+        )
+
+        # (선택) 잔차 보정용 아주 얕은 헤드: convex 결과 + residual
+        self.residual_head = nn.Sequential(
+            nn.Conv2d(1 + cf, mid, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, 3, 1, 1)
+        )
+
+        # 초기화를 살짝 안정적으로: softmax 전 logits ~0 → 거의 uniform
+        for m in self.mask_pred.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                nn.init.zeros_(m.bias)
+        for m in self.residual_head.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def _check_shapes(self, disp_q, fused_q):
+        B, _, h, w = disp_q.shape
+        B2, Cf, h2, w2 = fused_q.shape
+        assert B == B2 and h == h2 and w == w2, f"shape mismatch: disp {disp_q.shape}, fused {fused_q.shape}"
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor) -> torch.Tensor:
+        """
+        반환: 원본 해상도 disparity [B,1,4h,4w]
+        """
+        self._check_shapes(disp_q, fused_q)
+        B, _, h, w = disp_q.shape
+        k, s = self.k, self.s
+        kk, ss = k * k, s * s
+
+        # 1) 마스크 예측: [B, ss*kk, h, w] → [B, ss, kk, h, w] → softmax(kk축)
+        mask_logits = self.mask_pred(fused_q)                     # [B, ss*kk, h, w]
+        mask = mask_logits.view(B, ss, kk, h, w)
+        mask = F.softmax(mask, dim=2)
+
+        # 2) 3x3 패치 펼치기: [B,1,h,w] → unfold(3x3) → [B, kk, h*w] → [B, 1, kk, h, w]
+        disp_unf = F.unfold(disp_q, kernel_size=k, padding=k//2)  # [B, kk, h*w]
+        disp_unf = disp_unf.view(B, 1, kk, h, w)
+
+        # 3) 볼록 결합: 각 서브픽셀(ss개)에 대해 3x3 가중합 → [B, ss, h, w]
+        up = (mask * disp_unf).sum(dim=2)                         # [B, ss, h, w]
+
+        # 4) PixelShuffle로 4배 업샘플: [B, ss, h, w] → [B, 1, 4h, 4w]
+        disp_full = F.pixel_shuffle(up, upscale_factor=s)         # [B,1,4h,4w]
+
+        # 5) (선택) 잔차 보정: convex 결과 + 아주 얕은 residual (ACV/RAFT류도 종종 씀)
+        fused_up = F.interpolate(fused_q, size=(h * s, w * s), mode="bilinear", align_corners=False)
+        disp_full = disp_full + self.residual_head(torch.cat([disp_full, fused_up], dim=1))
+
+        return disp_full
+
+
+class ConvexUpsampleX4Lite(nn.Module):
+    """
+    메모리 세이프 convex 업샘플(+옵션 residual).
+    - 마스크 예측: 그대로 (저해상도 Cf 사용 → 메모리 영향 적음)
+    - residual: 풀해상도에서 Cf 대신 'ctx_ch'(작은 채널)만 사용
+    """
+    def __init__(self, cf: int = 256, k: int = 3, scale: int = 4,
+                 mid_mask: int = 64,     # 마스크 예측 중간 채널 (기존 128 → 64로 감량)
+                 ctx_ch: int = 24,       # 풀해상도 residual에 쓸 경량 컨텍스트 채널 수
+                 mid_residual: int = 64, # residual 중간 채널
+                 use_residual: bool = True):
+        super().__init__()
+        assert k == 3
+        self.k = k
+        self.s = scale
+        kk = k * k
+        ss = scale * scale
+        self.use_residual = use_residual
+
+        # (1) 마스크 예측은 저해상도에서 수행 → 그대로 두되 중간 채널만 축소
+        self.mask_pred = nn.Sequential(
+            nn.Conv2d(cf,      mid_mask, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_mask, ss * kk, 1, 1, 0)
+        )
+
+        # (2) residual용 컨텍스트를 저해상도에서 미리 1x1로 축소 → 업샘플
+        if use_residual:
+            self.ctx_reduce = nn.Conv2d(cf, ctx_ch, 1, 1, 0)
+            self.residual_head = nn.Sequential(
+                nn.Conv2d(1 + ctx_ch, mid_residual, 3, 1, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(mid_residual, 1, 3, 1, 1)
+            )
+
+        # 초기화
+        for m in self.mask_pred.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=1.0); nn.init.zeros_(m.bias)
+        if use_residual:
+            for m in self.residual_head.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu"); nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def _check_shapes(self, disp_q, fused_q):
+        B, _, h, w  = disp_q.shape
+        B2, Cf, h2, w2 = fused_q.shape
+        assert B == B2 and h == h2 and w == w2, f"shape mismatch: disp {disp_q.shape}, fused {fused_q.shape}"
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor) -> torch.Tensor:
+        """
+        in:
+          disp_q  : [B,1,h,w]   (1/4 해상도 disparity)
+          fused_q : [B,Cf,h,w]  (1/4 해상도 컨텍스트)
+        out:
+          disp_full: [B,1,4h,4w]
+        """
+        self._check_shapes(disp_q, fused_q)
+        B, _, h, w = disp_q.shape
+        kk, ss, s  = self.k * self.k, self.s * self.s, self.s
+
+        # 1) convex 마스크 (저해상도)
+        mask_logits = self.mask_pred(fused_q)               # [B, ss*kk, h, w]
+        mask = mask_logits.view(B, ss, kk, h, w)
+        mask = F.softmax(mask, dim=2)
+
+        # 2) 3x3 패치 펼치기 (저해상도)
+        disp_unf = F.unfold(disp_q, kernel_size=self.k, padding=self.k//2)  # [B, kk, h*w]
+        disp_unf = disp_unf.view(B, 1, kk, h, w)
+
+        # 3) 볼록 결합 → [B, ss, h, w]
+        up = (mask * disp_unf).sum(dim=2)
+
+        # 4) PixelShuffle로 x4 업샘플 → [B,1,4h,4w]
+        disp_full = F.pixel_shuffle(up, upscale_factor=s)
+
+        if not self.use_residual:
+            return disp_full
+
+        # 5) 메모리 세이프 residual: Cf를 바로 업샘플하지 말고, 저해상도에서 축소 후 업샘플
+        ctx_small = self.ctx_reduce(fused_q)                             # [B, ctx_ch, h, w]
+        ctx_up    = F.interpolate(ctx_small, size=(h*s, w*s), mode="bilinear", align_corners=False)  # [B,ctx_ch,4h,4w]
+
+        # 6) 잔차 보정
+        disp_full = disp_full + self.residual_head(torch.cat([disp_full, ctx_up], dim=1))
+        return disp_full
+
+class FullRefineLite(nn.Module):
+    def __init__(self, cf: int = 256, use_residual: bool = True,
+                 ctx_ch: int = 24, mid_residual: int = 64, mid_mask: int = 64):
+        super().__init__()
+        self.up = ConvexUpsampleX4Lite(cf=cf, use_residual=use_residual,
+                                       ctx_ch=ctx_ch, mid_residual=mid_residual, mid_mask=mid_mask)
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor, out_hw=None) -> torch.Tensor:
+        return self.up(disp_q, fused_q)
+
+class FullRefine(nn.Module):
+    def __init__(self, cf: int = 256, mid: int = 64):
+        super().__init__()
+        # 내부 구현을 convex 업샘플로 바꾼다
+        self.up = ConvexUpsampleX4(cf=cf, mid=128)  # mid는 마스크/잔차 헤드의 내부 채널
+
+    def forward(self, disp_q: torch.Tensor, fused_q: torch.Tensor, out_hw: Optional[tuple] = None) -> torch.Tensor:
+        # out_hw는 더 이상 필요 없음(정확히 ×4 스케일이 보장됨)
+        return self.up(disp_q, fused_q)
+# ---------------------------
+# 7) SOTA-inspired Decoder (ACV + MCCV + 3D agg + opt. 2-stage)
+# ---------------------------
+class SOTAStereoDecoder(nn.Module):
+    def __init__(self,
+                 max_disp_px: int = 192,
+                 fused_in_ch: int = 512,    # ← 백본 확장(cf=512)과 맞춤
+                 red_ch: int = 48,
+                 base3d: int = 32,          # 필요시 48/64로 확대 가능
+                 use_motif: bool = True,
+                 two_stage: bool = True,    # 로컬 단계 사용 권장
+                 local_radius_cells: int = 8):
+        super().__init__()
+        self.D = max(1, max_disp_px // 4)       # 전역 D (예: 192/4=48)
+        self.concat = ConcatVolume1_4(in_ch=fused_in_ch, red_ch=red_ch)
+        self.acv    = ACVAttention(out_ch=2 * red_ch, hidden=16)
+
+        # ★ 전역 집계: GN + D축 stride=1 hourglass 사용
+        self.agg = Hourglass3D_GN_D1_Align(
+            in_ch=2 * red_ch, base=base3d, gn_groups=8,
+            n_res_enc=(1,1), n_res_mid=2, n_res_dec=(1,1),
+            use_dmix=True
+        )
+
+        # 업샘플/정제 (기존 사용 유지)
+        self.refine_full = FullRefine(cf=fused_in_ch)
+        # self.refine_full = FullRefineLite(cf=fused_in_ch, use_residual=True, ctx_ch=24, mid_residual=64, mid_mask=64)
+
+        self.use_motif = use_motif
+        if use_motif:
+            self.motif_proj_L = MotifProjector(in_ch=fused_in_ch, m_ch=24)
+            self.motif_proj_R = MotifProjector(in_ch=fused_in_ch, m_ch=24)
+            self.mccv_gate     = MCCVGating(m_ch=24, out_ch=2 * red_ch)
+
+        # ★ 로컬 2-stage
+        self.two_stage = two_stage
+        self.local_r   = local_radius_cells
+        if two_stage:
+            self.acv_local = ACVAttention(out_ch=2 * red_ch, hidden=8)
+            self.agg_local = Hourglass3D_GN_D1_Align(
+                in_ch=2 * red_ch, base=base3d, gn_groups=8,
+                n_res_enc=(1,0), n_res_mid=1, n_res_dec=(1,0),
+                use_dmix=True
+            )
+
+        self.corr_builder = CorrVolume1_4(max_disp_px=max_disp_px)
+
+    @torch.no_grad()
+    def _check_inputs(self, out: Dict):
+        assert "left" in out and "right" in out and "meta" in out
+        assert "cossim_feat_1_4" in out["left"] and "fused_1_4" in out["left"]
+        assert "cossim_feat_1_4" in out["right"]
+        assert "valid_hw" in out["meta"]
+
+    def _build_acv_volume(self, Lcorr, Rcorr, Lfuse, Rfuse) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        # corr volume (cos-sim)
+        corr = self.corr_builder(Lcorr, Rcorr)                              # [B,D,H4,W4]
+        # concat volume (channel-reduced)
+        concat_vol, Cr = self.concat(Lfuse, Rfuse, self.D)                  # [B,2*Cr,D,H4,W4]
+        # ACV weights from corr
+        w_corr = self.acv(corr)                                             # [B,2*Cr,D,H4,W4]
+        vol_acv = concat_vol * w_corr                                       # [B,2*Cr,D,H4,W4]
+        return vol_acv, corr, Cr
+
+    def forward(self, backbone_out: Dict) -> Dict[str, torch.Tensor]:
+        self._check_inputs(backbone_out)
+
+        # fetch features
+        Lcorr = backbone_out["left"]["cossim_feat_1_4"]    # [B,H4,W4,C] (L2 norm)
+        Rcorr = backbone_out["right"]["cossim_feat_1_4"]
+        Lfuse = backbone_out["left"]["fused_1_4"]          # [B,Cf,H4,W4]
+        Rfuse = backbone_out["right"]["fused_1_4"]
+        H, W  = backbone_out["meta"]["valid_hw"]
+
+        # --- Stage-1: ACV ( + MCCV gating ) ---
+        vol_acv, corr_vol, Cr = self._build_acv_volume(Lcorr, Rcorr, Lfuse, Rfuse)  # [B,2Cr,D,H4,W4], [B,D,H4,W4]
+
+        if self.use_motif:
+            ML = self.motif_proj_L(Lfuse)     # [B,m,H4,W4]
+            MR = self.motif_proj_R(Rfuse)
+            w_mccv = self.mccv_gate(ML, MR, self.D)          # [B,2Cr,D,H4,W4]
+            vol_acv = vol_acv * (0.5 + 0.5 * w_mccv)         # gentle gating
+
+        # 3D aggregation -> logits
+        logits = self.agg(vol_acv)                           # [B,D,H4,W4]
+        prob   = F.softmax(-logits, dim=1)
+        disp_q = soft_argmin(prob) * 4.0                     # pixel units at 1/4
+
+        out = {
+            "prob_volume_1_4": prob,
+            "corr_volume_1_4": corr_vol,
+            "disp_1_4_stage1": disp_q,
+            "logits_1_4": -logits,
+        }
+
+        # --- (optional) Stage-2: local-range refine (IGEV++ spirit) ---
+        if self.two_stage and self.local_r > 0:
+            B, _, H4, W4 = disp_q.shape
+            d0 = (disp_q / 4.0).detach()  # center in cell units
+            # build local window indices [ -r ... +r ]
+            Dloc = 2 * self.local_r + 1
+            offs = torch.arange(-self.local_r, self.local_r + 1, device=disp_q.device, dtype=disp_q.dtype).view(1, Dloc, 1, 1)
+            # clamp to [0, D-1]
+            d_idx = (d0 + offs).clamp_(0, float(self.D - 1))  # [B,Dloc,H4,W4]
+            # gather corr weights at local offsets
+            # (bilinear gather along disparity dim)
+            d_floor = d_idx.floor().long()
+            d_ceil  = (d_floor + 1).clamp(max=self.D - 1)
+            alpha   = (d_idx - d_floor.float())
+            # corr: [B,D,H4,W4] -> local corr [B,Dloc,H4,W4]
+            corr_f = torch.gather(corr_vol, 1, d_floor)
+            corr_c = torch.gather(corr_vol, 1, d_ceil)
+            corr_loc = (1 - alpha) * corr_f + alpha * corr_c  # [B,Dloc,H4,W4]
+
+            # local concat volume (same channel reduce & shifting by nearest offset)
+            Lr = self.concat.reduce(Lfuse)  # [B,Cr,H4,W4]
+            Rr = self.concat.reduce(Rfuse)
+
+            vols = []
+            # use nearest integer shift for concat (lightweight)
+            for i in range(Dloc):
+                di = d_floor[:, i, :, :].view(B, 1, H4, W4)  # integer shift per-pixel
+                # approximate by uniform shift with median di to stay efficient
+                # (full per-pixel warp is heavy; this is a pragmatic trade-off)
+                d_med = torch.median(di.float()).item()
+                d_med = int(max(0, min(self.D - 1, round(d_med))))
+                R_shift = _shift_right_feats(Rr, d_med)
+                vols.append(torch.cat([Lr, R_shift], dim=1))
+            vol_concat_loc = torch.stack(vols, dim=2)        # [B,2Cr,Dloc,H4,W4]
+
+            # ACV local attention
+            w_loc = self.acv_local(corr_loc)                  # [B,2Cr,Dloc,H4,W4]
+            vol_loc = vol_concat_loc * w_loc
+            logits2 = self.agg_local(vol_loc)                 # [B,Dloc,H4,W4]
+            prob2   = F.softmax(-logits2, dim=1)
+            disp_ref_cell = soft_argmin(prob2) + (d0 - self.local_r)  # re-center
+            disp_idx = torch.argmax(prob, dim=1, keepdim=True).to(prob.dtype) * 4.0
+            disp_q = disp_ref_cell * 4.0
+            out.update({
+                "prob_volume_local_1_4": prob2,
+                "disp_1_4_stage2": disp_q,
+                "logits_1_4_ref": -logits2,
+            })
+
+        # --- Full-res refine ---
+        disp_full = self.refine_full(disp_q, Lfuse, (H, W))
+        out["disp_full"] = disp_full
+        out["confidence_1_4"] = 1.0 - entropy_map(out["prob_volume_1_4"])
+        out["disp_1_4"] = disp_q
+        return out
+
