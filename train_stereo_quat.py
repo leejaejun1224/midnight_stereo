@@ -641,13 +641,13 @@ def get_args():
     p.add_argument("--seed",       type=int, default=42)
 
     # 손실 가중치
-    p.add_argument("--w_dir",              type=float, default=.0)
-    p.add_argument("--w_reproj",           type=float, default=.0)
+    p.add_argument("--w_dir",              type=float, default=1.0)
+    p.add_argument("--w_reproj",           type=float, default=1.0)
     p.add_argument("--w_distill",          type=float, default=0.0)
     p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.01,   help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.00,   help="Smoothness  @Full-res")
 
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)

@@ -1040,6 +1040,7 @@ def fmt_metrics(m: Optional[Dict[str, float]]) -> str:
     if not m: return "N/A"
     return (f"EPE={m['EPE']:.3f} | D1={m['D1_all']:.2f}% | "
             f">1px={m['>1px']:.2f}% | >2px={m['>2px']:.2f}% | N={m['Npix']}")
+    
 def load_gt_disp_px(gt_path, mode, depth_scale, disp_scale, focal_px, baseline_m,
                     target_hw, invalid_values=(0,65535), max_depth_m=200.0):
     raw = np.array(Image.open(str(gt_path))).astype(np.float32)  # raw 그대로
@@ -1054,18 +1055,10 @@ def load_gt_disp_px(gt_path, mode, depth_scale, disp_scale, focal_px, baseline_m
     if mode == "depth":
         depth_m = raw / float(depth_scale)
         # 2) 비현실 큰 깊이도 무효(센티널 필터 못잡은 경우 보호장치)
-        if max_depth_m > 0:
-            inv |= (depth_m > float(max_depth_m))
-        inv |= ~np.isfinite(depth_m) | (depth_m <= 0)
-        depth_m[inv] = np.nan
-        disp_px = (focal_px * baseline_m) / np.clip(depth_m, 1e-6, None)
+        depth_m[~np.isfinite(raw) | (raw <= 0)] = np.nan
+        disp_px = (focal_px * baseline_m) / np.clip(depth_m, 1e-6, None)  # depth->disparity
         disp_px[~np.isfinite(disp_px)] = np.nan
-    else:  # "disp"
-        disp_px = raw / float(disp_scale)
-        inv |= ~np.isfinite(disp_px) | (disp_px <= 0)
-        disp_px[inv] = np.nan
-
-    return disp_px.astype(np.float32)
+    return disp_px
 
 # -----------------------------
 # 시각화 묶음 (Pred vs GT)
@@ -1236,7 +1229,6 @@ def process_pair_and_viz(
     if depth_path is None:
         print(f"[Skip] GT depth not found for {stem}")
         return
-
     invalid_vals = _parse_invalid_values(args.gt_invalid_values)
     disp_gt_px = load_gt_disp_px(
         depth_path,
@@ -1294,9 +1286,9 @@ def get_args():
 
     # 엔트로피/ROI 파라미터 (기본값: 학습 코드와 동일 계열)
     p.add_argument("--ent_T", type=float, default=0.1)
-    p.add_argument("--ent_vis_thr", type=float, default=0.8)
+    p.add_argument("--ent_vis_thr", type=float, default=0.7)
     p.add_argument("--roi_mode", type=str, default="frac", choices=["frac","abs4"])
-    p.add_argument("--roi_u0", type=float, default=0.3)
+    p.add_argument("--roi_u0", type=float, default=0.2)
     p.add_argument("--roi_u1", type=float, default=0.7)
     p.add_argument("--roi_v0", type=float, default=2/3)
     p.add_argument("--roi_v1", type=float, default=1.0)
