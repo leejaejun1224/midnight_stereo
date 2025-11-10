@@ -699,7 +699,7 @@ def main():
     parser.add_argument("--right_dir", type=str, default="/home/jaejun/dataset/MS2/sync_data/_2021-08-13-22-36-41/rgb/img_right", help="Directory of right images")
     parser.add_argument("--glob", type=str, default="*.png", help="Glob pattern for left images in left_dir")
 
-    parser.add_argument("--max_disp", type=int, default=22, help="Max disparity on 1/4 grid (inclusive)")
+    parser.add_argument("--max_disp", type=int, default=14, help="Max disparity on 1/4 grid (inclusive)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--pad_to_8", action="store_true",
                         help="Pad right/bottom so H,W become multiples of 8 (both left & right).")

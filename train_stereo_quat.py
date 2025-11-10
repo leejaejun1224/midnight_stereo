@@ -13,11 +13,11 @@ from logger import save_args_as_text
 # =========================
 # (환경에 맞게 경로 조정)
 # =========================
-# from vit_cn import StereoModel
-from vit_cn_L import StereoModel
-# from agg.aggregator import SOTAStereoDecoder
-from agg.aggregator_plus import SOTAStereoDecoder
-from agg.decoder_selective_igev import IGEVStereo
+from vit_cn import StereoModel
+# from vit_cn_L import StereoModel
+from agg.aggregator import SOTAStereoDecoder
+# from agg.aggregator_plus import SOTAStereoDecoder
+# from agg.decoder_selective_igev import IGEVStereo
 from logger import save_args_txt_dynamic
 
 from tools import (
@@ -39,7 +39,7 @@ from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
     FeatureReprojLoss,
     AdaptiveWindowDistillLoss,
-    ROIEntropySmoothL1Loss
+    EntropySmoothnessLoss
     # PhotometricLoss,
 )
 torch.backends.cudnn.benchmark = True
@@ -298,29 +298,32 @@ def train(args):
         lambda_v=args.lambda_v, lambda_h=args.lambda_h,
         huber_delta=args.huber_delta_h
     ).to(device)
-    criterion = AdaptiveWindowDistillLoss(
-            max_disp=args.max_disp_px / 4.0,
-            roi_mode="frac", roi_u0=0.3, roi_u1=7.0, roi_v0=0.7, roi_v1=1.0,
-            ent_T=0.1, ent_vis_thr=0.6, train_ent_thr=None,  # after-entropy gating off
-            max_half=12, T_teacher=0.1, T_student=1.0,
-            lambda_kl=1.0, lambda_reg=0.5,
-            use_peak_weight=True, weight_alpha=1.0, weight_beta=1.0,
-            weight_gamma=0.5, weight_delta=1.0,
-            gap_min=1.0, gap_norm=4.0, L0=8.0
-        ).to(device)
+    # criterion = AdaptiveWindowDistillLoss(
+    #         max_disp=args.max_disp_px / 4.0,
+    #         roi_mode="frac", roi_u0=0.3, roi_u1=7.0, roi_v0=0.7, roi_v1=1.0,
+    #         ent_T=0.1, ent_vis_thr=0.6, train_ent_thr=None,  # after-entropy gating off
+    #         max_half=12, T_teacher=0.1, T_student=1.0,
+    #         lambda_kl=1.0, lambda_reg=0.5,
+    #         use_peak_weight=True, weight_alpha=1.0, weight_beta=1.0,
+    #         weight_gamma=0.5, weight_delta=1.0,
+    #         gap_min=1.0, gap_norm=4.0, L0=8.0
+    #     ).to(device)
     
-    roi_l1_crit = ROIEntropySmoothL1Loss(
-        max_disp=int(args.max_disp_px // 4),      # 1/4 그리드 단위
+    entropy_loss_fn  = EntropySmoothnessLoss(
+        max_disp=int(args.max_disp_px // 4),  # 1/4-그리드 최대 시차
         roi_mode=args.roi_mode,
         roi_u0=args.roi_u0, roi_u1=args.roi_u1,
         roi_v0=args.roi_v0, roi_v1=args.roi_v1,
-        ent_T=args.roi_ent_T, ent_thr=args.roi_ent_thr,  # invalid_before 필터 전용
-        max_half=args.roi_win_half_max,
-        teacher_type=args.roi_teacher,  # "arg" 권장
+        ent_T=args.ent_T,            # 0.1
+        ent_thr=args.ent_thr,    # 0.6
+        win_half_max=args.win_half_max,  # 12
+        teacher_type="arg",          # or "soft"
         T_teacher=0.1,
-        beta=args.roi_beta,
-        apply_area="roi",
-        student_unit="px"               # pred["disp_1_4"]는 px 단위(1/4 해상도)
+        beta=1.0,
+        supervise_area="filled",     # "filled" 권장 (네가 실제로 채워서 쓰는 부분만 감독)
+        student_unit="px",           # pred["disp_1_4"]는 px이므로
+        two_stage=True,
+        stop_teacher_grad=True       # 교사 경로로 grad 차단 권장
     ).to(device)
     
     # (선택) Feature reprojection loss — args.w_reproj 있을 때만 켜기
@@ -460,9 +463,8 @@ def train(args):
                     logits = unpad_last2(pred["logits_1_4"], pad_q)
                 else:
                     logits = unpad_last2(pred["logits_1_4"], pad_q)
-                distill_loss = criterion(FqL, FqR, logits, return_debug=True) * args.w_distill
-                loss_roi_l1 = roi_l1_crit(FqL, FqR, disp_q_px) * args.w_roi_l1
-                # Smoothness @Full-res
+                # distill_loss = criterion(FqL, FqR, logits, return_debug=True) * args.w_distill
+                loss_entropy = entropy_loss_fn(FqL, FqR, disp_q_qpx) * args.w_entropy
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
 
                 # 총손실
@@ -470,7 +472,7 @@ def train(args):
                     loss_dir
                     + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
                 )
-                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full + distill_loss + loss_roi_l1
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full  + loss_entropy
 
             # 최적화
             optim.zero_grad(set_to_none=True)
@@ -564,7 +566,7 @@ def train(args):
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
                       f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
-                      f"distill={float(distill_loss):.4f} , roi_l1={float(loss_roi_l1):.4f}, "
+                      f"loss_entropy={float(loss_entropy):.4f}, "
                       f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
                       f"photoF={float(loss_photo_full):.4f}, smoothF={float(loss_smooth_full):.4f})"
                       f"{extra_eval}")
@@ -614,12 +616,12 @@ def get_args():
 
     # 모델/디코더
     p.add_argument("--max_disp_px", type=int, default=56)
-    p.add_argument("--fused_ch",    type=int, default=512)
+    p.add_argument("--fused_ch",    type=int, default=320)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
-    p.add_argument("--local_radius", type=int, default=0)
+    p.add_argument("--local_radius", type=int, default=8)
 
     # (IGE V params — 보유 시)
     p.add_argument("--hidden_dims", default=[128, 128, 128])
@@ -648,7 +650,9 @@ def get_args():
     p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.00,   help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.01,   help="Smoothness  @Full-res")
+    p.add_argument("--w_entropy",   type=float, default=0.5,   help="Entropy Smoothness  @1/4")
+
 
     p.add_argument("--photo_l1_w",         type=float, default=0.15)
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
@@ -673,9 +677,9 @@ def get_args():
     p.add_argument("--roi_u1",          type=float, default=0.7)
     p.add_argument("--roi_v0",          type=float, default=2/3)
     p.add_argument("--roi_v1",          type=float, default=1.0)
-    p.add_argument("--roi_ent_T",       type=float, default=0.1)
-    p.add_argument("--roi_ent_thr",     type=float, default=0.65)
-    p.add_argument("--roi_win_half_max",type=int,   default=12)
+    p.add_argument("--ent_T",       type=float, default=0.1)
+    p.add_argument("--ent_thr",     type=float, default=0.6)
+    p.add_argument("--win_half_max",type=int,   default=12)
     p.add_argument("--roi_teacher",     type=str,   default="arg", choices=["arg","soft"])
     p.add_argument("--roi_beta",        type=float, default=1.0)
 

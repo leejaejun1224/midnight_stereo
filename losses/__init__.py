@@ -9,7 +9,8 @@ from .entropy import EntropySharpnessLoss
 from .seed_anchor import SeedAnchorHuberLoss
 from .sky import SkyGridZeroLoss
 from .windowdistill import AdaptiveWindowDistillLoss
-from .window_distill_parameter_test import ROIEntropySmoothL1Loss
+from .roientropysmoothloss import EntropySmoothnessLoss
+
 __all__ = [
     "SSIM", "PhotometricLoss",
     "warp_right_to_left_image", "warp_right_to_left",
@@ -22,5 +23,5 @@ __all__ = [
     "SeedAnchorHuberLoss",
     "SkyGridZeroLoss",
     "AdaptiveWindowDistillLoss",
-    "ROIEntropySmoothL1Loss"
+    "EntropySmoothnessLoss"
 ]
