@@ -658,7 +658,7 @@ def get_args():
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
 
     # DirectionalRelScaleDispLoss 하이퍼
-    p.add_argument("--sim_thr",      type=float, default=0.8)
+    p.add_argument("--sim_thr",      type=float, default=0.95)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)
     p.add_argument("--use_dynamic_thr", action="store_true")

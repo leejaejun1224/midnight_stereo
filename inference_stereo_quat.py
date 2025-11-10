@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader
 # =========================
 # (환경에 맞게 경로 조정)
 # =========================
-# from vit_cn import StereoModel
-from vit_cn_L import StereoModel
+from vit_cn import StereoModel
+# from vit_cn_L import StereoModel
 from agg.aggregator import SOTAStereoDecoder
 
 from tools import (
@@ -744,7 +744,7 @@ def get_args():
 
     # 모델/디코더 (학습과 동일하게 맞춰야 정확)
     p.add_argument("--max_disp_px", type=int, default=56)
-    p.add_argument("--fused_ch",    type=int, default=512)
+    p.add_argument("--fused_ch",    type=int, default=320)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
