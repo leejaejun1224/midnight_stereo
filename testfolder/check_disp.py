@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 fx = 764.5138549804688
 baseline_m = 0.29918420530585865
 
-raw = np.array(Image.open("/home/jaejun/dataset/MS2/proj_depth/tester/rgb/depth_filtered/000100.png")).astype(np.float32)
+raw = np.array(Image.open("/home/jaejun/dataset/MS2/proj_depth/tester/rgb/depth_filtered/000137.png")).astype(np.float32)
 depth_m = raw / 256.0                        # mm -> m
 depth_m[(raw <= 0) | ~np.isfinite(raw)] = np.nan
 

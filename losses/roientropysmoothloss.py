@@ -344,8 +344,8 @@ class EntropySmoothnessLoss(nn.Module):
         if student_disp.dim() == 3:
             student_disp = student_disp.unsqueeze(1)    # [B,1,H4,W4]
         pred = student_disp
-        if self.student_unit == "px":
-            pred = pred / 4.0                           # px → cell
+        # if self.student_unit == "px":
+        #     pred = pred / 4.0                           # px → cell
 
         # (옵션) teacher 경로 grad 차단
         FqL_t = FqL.detach() if self.stop_teacher_grad else FqL

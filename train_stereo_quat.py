@@ -37,6 +37,7 @@ from tools import (
 )
 from losses import (
     DirectionalRelScaleDispLoss,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
+    DirectionalRelScaleDispLossSGM,   # (세로 [-1,0]/[0,1] + cossim_feat 버전)
     FeatureReprojLoss,
     AdaptiveWindowDistillLoss,
     EntropySmoothnessLoss
@@ -288,26 +289,42 @@ def train(args):
     })
 
     # --- 손실 (모두 1/4 + Full-res 추가) ---
-    dir_loss_fn = DirectionalRelScaleDispLoss(
+    # dir_loss_fn = DirectionalRelScaleDispLoss(
+    #     sim_thr=args.sim_thr, sim_gamma=args.sim_gamma,
+    #     sample_k=args.sim_sample_k,
+    #     use_dynamic_thr=args.use_dynamic_thr, dynamic_q=args.dynamic_q,
+    #     vert_up_allow=args.vert_up_allow,         # 위쪽: Δ ∈ [-1,0]
+    #     vert_down_allow=args.vert_down_allow,     # 아래: Δ ∈ [0,+1]
+    #     horiz_margin=args.horiz_margin,           # 가로 대칭 허용
+    #     lambda_v=args.lambda_v, lambda_h=args.lambda_h,
+    #     huber_delta=args.huber_delta_h
+    # ).to(device)
+    
+    dir_loss_fn = DirectionalRelScaleDispLossSGM(
         sim_thr=args.sim_thr, sim_gamma=args.sim_gamma,
-        sample_k=args.sim_sample_k,
         use_dynamic_thr=args.use_dynamic_thr, dynamic_q=args.dynamic_q,
         vert_up_allow=args.vert_up_allow,         # 위쪽: Δ ∈ [-1,0]
         vert_down_allow=args.vert_down_allow,     # 아래: Δ ∈ [0,+1]
         horiz_margin=args.horiz_margin,           # 가로 대칭 허용
         lambda_v=args.lambda_v, lambda_h=args.lambda_h,
-        huber_delta=args.huber_delta_h
+        t1_px = 0.25,             # 작은 위반 임계 (~0.3~0.7 px)
+        t2_px = 0.25,             # 큰 위반 임계 (~1.0~2.0 px)
+        P1 = 10.0,                # 작은 위반 기울기
+        P2 = 40.0,                # 큰 위반 기울기(>P1)
+        huber_small = 0.5,       # 단계1의 허버 델타
+        huber_large = 1.0
     ).to(device)
-    # criterion = AdaptiveWindowDistillLoss(
-    #         max_disp=args.max_disp_px / 4.0,
-    #         roi_mode="frac", roi_u0=0.3, roi_u1=7.0, roi_v0=0.7, roi_v1=1.0,
-    #         ent_T=0.1, ent_vis_thr=0.6, train_ent_thr=None,  # after-entropy gating off
-    #         max_half=12, T_teacher=0.1, T_student=1.0,
-    #         lambda_kl=1.0, lambda_reg=0.5,
-    #         use_peak_weight=True, weight_alpha=1.0, weight_beta=1.0,
-    #         weight_gamma=0.5, weight_delta=1.0,
-    #         gap_min=1.0, gap_norm=4.0, L0=8.0
-    #     ).to(device)
+    
+    criterion = AdaptiveWindowDistillLoss(
+            max_disp=args.max_disp_px / 4.0,
+            roi_mode="frac", roi_u0=0.3, roi_u1=7.0, roi_v0=0.7, roi_v1=1.0,
+            ent_T=0.1, ent_vis_thr=0.6, train_ent_thr=None,  # after-entropy gating off
+            max_half=12, T_teacher=0.1, T_student=1.0,
+            lambda_kl=1.0, lambda_reg=0.5,
+            use_peak_weight=True, weight_alpha=1.0, weight_beta=1.0,
+            weight_gamma=0.5, weight_delta=1.0,
+            gap_min=1.0, gap_norm=4.0, L0=8.0
+        ).to(device)
     
     entropy_loss_fn  = EntropySmoothnessLoss(
         max_disp=int(args.max_disp_px // 4),  # 1/4-그리드 최대 시차
@@ -463,8 +480,9 @@ def train(args):
                     logits = unpad_last2(pred["logits_1_4"], pad_q)
                 else:
                     logits = unpad_last2(pred["logits_1_4"], pad_q)
-                # distill_loss = criterion(FqL, FqR, logits, return_debug=True) * args.w_distill
+                distill_loss = criterion(FqL, FqR, logits, return_debug=True) * args.w_distill
                 loss_entropy = entropy_loss_fn(FqL, FqR, disp_q_qpx) * args.w_entropy
+                # Smoothness @Full-res
                 loss_smooth_full = get_disparity_smooth_loss(disp_full_px, imgL_01) * args.w_smooth_fullres
 
                 # 총손실
@@ -472,7 +490,7 @@ def train(args):
                     loss_dir
                     + loss_reproj if isinstance(loss_reproj, torch.Tensor) else loss_dir + torch.tensor(loss_reproj, device=device, dtype=loss_dir.dtype)
                 )
-                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full  + loss_entropy
+                loss = loss + loss_photo_q + loss_smooth_q + loss_photo_full + loss_smooth_full + distill_loss + loss_entropy
 
             # 최적화
             optim.zero_grad(set_to_none=True)
@@ -566,7 +584,7 @@ def train(args):
                 print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(loader)}] "
                       f"loss={running/args.log_every:.4f} "
                       f"(dir={float(loss_dir):.4f}, reproj={lrp:.4f}, "
-                      f"loss_entropy={float(loss_entropy):.4f}, "
+                      f"distill={float(distill_loss):.4f} , loss_entropy={float(loss_entropy):.4f}, "
                       f"photoQ={float(loss_photo_q):.4f}, smoothQ={float(loss_smooth_q):.4f}, "
                       f"photoF={float(loss_photo_full):.4f}, smoothF={float(loss_smooth_full):.4f})"
                       f"{extra_eval}")
@@ -597,7 +615,6 @@ def train(args):
                 }, ckpt_path)
             print(f"[Save] {ckpt_path}")
 
-
 # =========================
 # argparse
 # =========================
@@ -615,8 +632,8 @@ def get_args():
     p.add_argument("--width",  type=int, default=1224)
 
     # 모델/디코더
-    p.add_argument("--max_disp_px", type=int, default=56)
-    p.add_argument("--fused_ch",    type=int, default=320)
+    p.add_argument("--max_disp_px", type=int, default=32)
+    p.add_argument("--fused_ch",    type=int, default=512)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
@@ -635,7 +652,7 @@ def get_args():
 
     # 학습
     p.add_argument("--epochs",     type=int, default=20)
-    p.add_argument("--decay_epoch", type=int, default=11)
+    p.add_argument("--decay_epoch", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--workers",    type=int, default=4)
     p.add_argument("--lr",         type=float, default=1e-4)
@@ -647,10 +664,10 @@ def get_args():
     p.add_argument("--w_dir",              type=float, default=1.0)
     p.add_argument("--w_reproj",           type=float, default=1.0)
     p.add_argument("--w_distill",          type=float, default=0.0)
-    p.add_argument("--w_photo_qres",       type=float, default=0.3,   help="Photometric @1/4")
+    p.add_argument("--w_photo_qres",       type=float, default=1.0,   help="Photometric @1/4")
     p.add_argument("--w_smooth_qres",      type=float, default=0.03,  help="Smoothness  @1/4")
     p.add_argument("--w_photo_fullres",    type=float, default=1.0,   help="Photometric @Full-res")
-    p.add_argument("--w_smooth_fullres",   type=float, default=0.01,   help="Smoothness  @Full-res")
+    p.add_argument("--w_smooth_fullres",   type=float, default=0.1,   help="Smoothness  @Full-res")
     p.add_argument("--w_entropy",   type=float, default=0.5,   help="Entropy Smoothness  @1/4")
 
 
@@ -658,7 +675,7 @@ def get_args():
     p.add_argument("--photo_ssim_w",       type=float, default=0.85)
 
     # DirectionalRelScaleDispLoss 하이퍼
-    p.add_argument("--sim_thr",      type=float, default=0.95)
+    p.add_argument("--sim_thr",      type=float, default=0.85)
     p.add_argument("--sim_gamma",    type=float, default=0.0)
     p.add_argument("--sim_sample_k", type=int,   default=1024)
     p.add_argument("--use_dynamic_thr", action="store_true")

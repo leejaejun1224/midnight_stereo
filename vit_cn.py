@@ -28,7 +28,7 @@ def load_dino_vits8(device: torch.device, eval_mode: bool = True):
     err_msgs = []
     # 1) torch.hub (공식)
     try:
-        model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
+        model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
     except Exception as e:
         err_msgs.append(f"torch.hub dino_vits8 load failed: {e}")
 
@@ -278,41 +278,28 @@ def unpad_1_4_lastdim(x: torch.Tensor, pad_b: int, pad_r: int) -> torch.Tensor:
     return x[:, : H - Hb4, : W - Wr4, :].contiguous()
 
 
-# -----------------------------
-# StereoModel (백본 교체/인터리빙 포함)
-# -----------------------------
 class StereoModel(nn.Module):
     """
-    제안된 백본:
-      - CosSim 전용: DINO ViT-S/8 4시프트 인터리빙으로 1/4 피처 (L2 normalized, [B,H/4,W/4,C])
-      - 다운스트림: ViT 1/8 토큰 업샘플(×2) + Conv 1/4 피처 concat 후 가벼운 융합 → [B,Cf,H/4,W/4]
-
-    forward(imgL, imgR) -> dict:
-      {
-        'left': {
-          'fused_1_4':        [B,Cf,H/4,W/4],
-          'cossim_feat_1_4':  [B,H/4,W/4,C],  # L2 normalized (cos 전용)
-          'vit_1_8':          [B,Cv,H/8,W/8],
-          'conv_1_4':         [B,Cc,H/4,W/4],
-        },
-        'right': { ... 동일 ... },
-        'meta': {
-          'valid_hw': (H, W),   # 언패드된 원본 해상도
-          'pad':      (pad_b, pad_r)
-        }
-      }
+    - Train: 기존 interleaving(4-shift) 사용 가능
+    - Eval (inference): interleaving 생략 → ViT 1/8 토큰을 x2 업샘플해서 1/4 cossim_feat 대체 생성
     """
+
     def __init__(
         self,
         device: Optional[torch.device] = None,
         freeze_vit: bool = True,
         amp: bool = True,
         cc: int = 192,
-        cv: int = 384,
-        cf: int = 320,
+        cv: int = 384 + 384,
+        cf: int = 512,
         autopad_to_8: bool = True,
         pad_mode_for_interleave: str = "replicate",
         vit_model: Optional[nn.Module] = None,
+
+        # ✅ NEW: interleaving 정책
+        interleave_train: bool = True,   # train 모드에서 interleaving 사용 여부
+        interleave_eval: bool = False,   # eval(추론) 모드에서 interleaving 사용 여부 (기본 False!)
+        no_interleave_up_mode: str = "bilinear",  # eval에서 1/8->1/4 업샘플 방식: "bilinear" or "nearest"
     ):
         super().__init__()
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -320,6 +307,12 @@ class StereoModel(nn.Module):
         self.freeze_vit = freeze_vit
         self.autopad_to_8 = autopad_to_8
         self.pad_mode_for_interleave = pad_mode_for_interleave
+
+        # NEW
+        self.interleave_train = interleave_train
+        self.interleave_eval = interleave_eval
+        self.no_interleave_up_mode = str(no_interleave_up_mode).lower().strip()
+        assert self.no_interleave_up_mode in ("bilinear", "nearest")
 
         # ViT (DINO ViT-S/8)
         self.vit = vit_model if vit_model is not None else load_dino_vits8(self.device, eval_mode=freeze_vit)
@@ -333,74 +326,102 @@ class StereoModel(nn.Module):
 
         self.to(self.device)
 
-    # ---- 단일 이미지에 대한 백본 ----
+    def _use_interleave(self) -> bool:
+        """
+        현재 모드(train/eval)에 따라 interleaving을 쓸지 결정.
+        """
+        if self.training:
+            return bool(self.interleave_train)
+        else:
+            return bool(self.interleave_eval)
+
+    def _upsample_tokens_to_quarter_lastdim(self, tokens_hw: torch.Tensor) -> torch.Tensor:
+        """
+        tokens_hw: [B,H/8,W/8,C]
+        return:    [B,H/4,W/4,C]  (L2 normalize 포함)
+        """
+        tok = tokens_hw.detach()  # cossim용은 grad 필요 없음
+        tok_c = tok.permute(0, 3, 1, 2).contiguous()  # [B,C,H/8,W/8]
+
+        if self.no_interleave_up_mode == "nearest":
+            tok_up = F.interpolate(tok_c, scale_factor=2, mode="nearest")
+        else:
+            tok_up = F.interpolate(tok_c, scale_factor=2, mode="bilinear", align_corners=False)
+
+        Fq = tok_up.permute(0, 2, 3, 1).contiguous()  # [B,H/4,W/4,C]
+        Fq = F.normalize(Fq, dim=-1)
+        return Fq
+
     def _backbone_single(self, img: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        img: [B,3,H,W] (RGB, ImageNet 정규화 가정)
-        반환: dict (왼/오 공통 구조)
-        """
         assert img.dim() == 4 and img.size(1) == 3
         img = img.to(self.device, non_blocking=True)
 
-        # 1) 필요시 우/하 패딩으로 8의 배수 정렬
+        # 1) 우/하 패딩으로 8의 배수 정렬
         pad_b = pad_r = 0
         if self.autopad_to_8:
             img, (pad_b, pad_r) = pad_right_bottom_to_multiple_of_8(img)
-        B, _, Hpad, Wpad = img.shape
-        H, W = Hpad - pad_b, Wpad - pad_r
 
-        # 2) CosSim 전용 1/4 피처 (인터리빙, L2 normalized)
-        #    - 비학습(no_grad), AMP, 4시프트 순차 실행
-        with torch.no_grad():
-            Fq = build_interleaved_quarter_features(
-                self.vit, img, pad_mode=self.pad_mode_for_interleave, amp=self.amp
-            )  # [B,H/4,W/4,C]
-        # 언패드 반영
-        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)  # [B,h4,w4,C]
-
-        # 3) ViT 1/8 토큰 (학습/동결 옵션)
+        # 2) ViT 1/8 토큰은 어차피 필요 → 먼저 1번만 뽑아두자
         tokens_hw = extract_vit_1_8_tokens(
             self.vit, img, enable_grad=not self.freeze_vit, amp=self.amp
         )  # [B,H/8,W/8,Cv]
-        V8 = tokens_hw.permute(0, 3, 1, 2).contiguous()  # [B,Cv,H/8,W/8]
-        V8 = unpad_1_8(V8, pad_b, pad_r)                 # 언패드
 
-        # 4) Conv 1/4
-        C4 = self.conv14(img)                            # [B,Cc,H/4,W/4]
+        # 3) CosSim 전용 1/4 피처
+        if self._use_interleave():
+            # ✅ 기존: interleaving(4-shift)
+            with torch.no_grad():
+                Fq = build_interleaved_quarter_features(
+                    self.vit, img, pad_mode=self.pad_mode_for_interleave, amp=self.amp
+                )  # [B,H/4,W/4,C]
+        else:
+            # ✅ NEW: eval(추론)에서는 interleaving 생략
+            with torch.no_grad():
+                Fq = self._upsample_tokens_to_quarter_lastdim(tokens_hw)  # [B,H/4,W/4,C]
+
+        # 언패드 반영 (1/4 last-dim)
+        Fq = unpad_1_4_lastdim(Fq, pad_b, pad_r)  # [B,h4,w4,C]
+
+        # 4) ViT 1/8 토큰 (decoder branch)
+        V8 = tokens_hw.permute(0, 3, 1, 2).contiguous()  # [B,Cv,H/8,W/8]
+        V8 = unpad_1_8(V8, pad_b, pad_r)
+
+        # 5) Conv 1/4
+        C4 = self.conv14(img)   # [B,Cc,H/4,W/4]
         C4 = unpad_1_4(C4, pad_b, pad_r)
 
-        # 5) 융합 @ 1/4
-        V8_up = F.interpolate(V8, scale_factor=2, mode="bilinear", align_corners=False)  # [B,Cv,H/4,W/4]
-        F4 = self.fuse14(C4, V8_up)                                                          # [B,Cf,H/4,W/4]
+        # 6) 융합 @ 1/4
+        V8_up = F.interpolate(V8, scale_factor=2, mode="bilinear", align_corners=False)
+
+        # ✅ 안전: 혹시 padding/언패드 때문에 1px 차이 나면 crop해서 맞춤
+        H4, W4 = C4.shape[-2], C4.shape[-1]
+        V8_up = V8_up[..., :H4, :W4]
+
+        F4 = self.fuse14(C4, V8_up)  # [B,Cf,H/4,W/4]
 
         return {
-            "fused_1_4":       F4,   # 다운스트림용
-            "cossim_feat_1_4": Fq,   # L2 normalized, cos 전용 (채널 마지막)
-            "conv_1_4":        C4,   # 필요시 사용
-            "vit_1_8":         V8,   # 필요시 사용
+            "fused_1_4":       F4,
+            "cossim_feat_1_4": Fq,
+            "conv_1_4":        C4,
+            "vit_1_8":         V8,
         }
 
-    # ---- 스테레오 입력 (좌/우) ----
     def forward(self, imgL: torch.Tensor, imgR: torch.Tensor) -> Dict[str, Dict]:
-        """
-        imgL, imgR: [B,3,H,W], ImageNet 정규화된 텐서
-        """
-        # 좌/우 동일 파이프라인
         outL = self._backbone_single(imgL)
         outR = self._backbone_single(imgR)
 
         H4, W4 = outL["fused_1_4"].shape[-2:]
         H8, W8 = outL["vit_1_8"].shape[-2:]
-        H  = H4 * 4
-        W  = W4 * 4
+        H = H4 * 4
+        W = W4 * 4
 
         return {
             "left":  outL,
             "right": outR,
             "meta": {
-                "valid_hw": (H, W),  # 언패드 후 원래 해상도
+                "valid_hw": (H, W),
                 "fused_shape":  (H4, W4),
                 "vit_1_8_shape": (H8, W8),
+                "use_interleave": self._use_interleave(),
             }
         }
 

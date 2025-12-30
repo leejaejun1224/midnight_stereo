@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 import os
+import glob
 import argparse
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import cv2  # ★ 추가: overlay 저장용
 
 # =========================
 # (환경에 맞게 경로 조정)
@@ -14,6 +16,7 @@ from torch.utils.data import DataLoader
 from vit_cn import StereoModel
 # from vit_cn_L import StereoModel
 from agg.aggregator import SOTAStereoDecoder
+# from agg.aggregator_plus import SOTAStereoDecoder
 
 from tools import (
     StereoFolderDataset,
@@ -22,6 +25,10 @@ from tools import (
     # --- metrics & GT loader (학습 코드와 동일 유틸) ---
     load_ms2_gt_depth_batch,
     compute_ms2_disparity_metrics,
+    # --- photometric error 시각화용 추가 ---
+    denorm_imagenet,
+    warp_right_to_left_image,
+    PhotometricLoss,
 )
 
 # =========================================================
@@ -100,14 +107,11 @@ def save_colormap_png_with_colorbar(
     vmax=None,
     cmap_name="magma",
     label: str = "",
-    bg_color: str = "#1e1e1e",  # ✅ 배경색(진한 회색)
+    bg_color: str = "#1e1e1e",
 ):
     """
-    오른쪽 colorbar가 포함된 컬러 PNG 저장. (에러맵 시각화용)
-    - NaN/invalid은 배경색으로 채워 가독성 향상.
-    - vmax 미지정 시 99th-percentile로 자동 설정하여 이상치에 덜 민감.
-    - vmin은 0으로 고정(오류 맵 가독성).
-    - figure/axes facecolor를 저장 시에도 강제로 반영하여 흰 테두리 문제 방지.
+    오른쪽 colorbar 포함 버전(에러맵 등). NaN은 배경색으로 렌더.
+    vmin=0 고정(오류맵 가독성), vmax 미지정시 99퍼센타일.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -117,7 +121,6 @@ def save_colormap_png_with_colorbar(
     _ensure_dir(os.path.dirname(path))
     arr = np.array(np_array, dtype=np.float32)
 
-    # 범위 설정(에러맵 전용: vmin=0 고정, vmax는 99th percentile)
     finite_mask = np.isfinite(arr)
     vmin = 0.0
     if not finite_mask.any():
@@ -129,33 +132,29 @@ def save_colormap_png_with_colorbar(
         else:
             vmax_eff = float(vmax)
 
-    # colormap 준비(❗NaN을 배경색으로 렌더)
     import numpy as _np
+    import matplotlib.pyplot as plt
     base_cmap = plt.get_cmap(cmap_name)
     cmap = ListedColormap(base_cmap(_np.linspace(0, 1, 256)))
     bg_rgba = to_rgba(bg_color)
-    cmap.set_bad(bg_rgba)  # NaN → 배경색
+    cmap.set_bad(bg_rgba)
 
-    # 이미지 크기에 맞춰 DPI/figsize 설정(픽셀 보존)
     H, W = arr.shape
     dpi = 200.0
     figsize = (W / dpi, H / dpi)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    # ✅ 배경색 지정
     fig.patch.set_facecolor(bg_color)
     ax.set_facecolor(bg_color)
 
     im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax_eff)
     ax.axis("off")
 
-    # 오른쪽 colorbar
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     if label:
         cbar.set_label(label, rotation=270, labelpad=12)
 
     plt.tight_layout(pad=0.1)
-    # ✅ 저장 시 facecolor 강제 반영
     fig.savefig(path, bbox_inches="tight", pad_inches=0.1, facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -170,8 +169,8 @@ def save_colormap_png_with_colorbar_auto_range(
 ):
     """
     일반 수치맵(예: disparity)용 컬러 PNG 저장 + colorbar.
-    - vmin/vmax 미지정 시 데이터의 finite min/max로 자동 설정(이상치 배제 안 함).
-    - NaN/invalid은 배경색으로 렌더.
+    vmin/vmax 미지정 시 데이터의 finite min/max로 자동 설정.
+    NaN은 배경색으로 렌더.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -192,9 +191,8 @@ def save_colormap_png_with_colorbar_auto_range(
 
     import numpy as _np
     base_cmap = plt.get_cmap(cmap_name)
-    from matplotlib.colors import ListedColormap, to_rgba
     cmap = ListedColormap(base_cmap(_np.linspace(0, 1, 256)))
-    cmap.set_bad(to_rgba(bg_color))  # NaN → 배경색
+    cmap.set_bad(to_rgba(bg_color))
 
     H, W = arr.shape
     dpi = 200.0
@@ -216,26 +214,17 @@ def save_colormap_png_with_colorbar_auto_range(
     plt.close(fig)
 
 def save_gray_png(path, np_array_uint8):
-    """
-    0/255 같은 8-bit 단일 채널 이미지를 PNG로 저장.
-    """
     from PIL import Image
     _ensure_dir(os.path.dirname(path))
     Image.fromarray(np_array_uint8.astype(np.uint8), mode="L").save(path)
 
 def annotate_png_top_left(path: str, text: str, margin: int = 5):
-    """
-    PNG에 좌측 상단 텍스트 오버레이(작게). 가독성을 위해 반투명 배경 + 외곽선.
-    """
     from PIL import Image, ImageDraw, ImageFont
-
     try:
         img = Image.open(path).convert("RGBA")
     except Exception:
-        return  # 이미지가 없으면 스킵
-
+        return
     W, H = img.size
-    # 글자 크기: 작은 텍스트(짧은 쪽의 2.5%)
     fs = max(10, int(min(W, H) * 0.025))
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", fs)
@@ -252,16 +241,76 @@ def annotate_png_top_left(path: str, text: str, margin: int = 5):
     except Exception:
         tw, th = draw.textsize(text, font=font)
 
-    # 반투명 배경 박스
     bg = Image.new("RGBA", (tw + margin * 2, th + margin * 2), (0, 0, 0, 100))
     img.paste(bg, (margin, margin), bg)
-
-    # 흰색 텍스트 + 검은 외곽선
     draw.text((margin * 2, margin * 2), text, font=font,
               fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
-
     img = img.convert("RGB")
     img.save(path)
+
+def upsample_np(arr: np.ndarray, scale: int = 4, mode: str = "bilinear") -> np.ndarray:
+    """
+    수치맵을 scale배로 upsample (시각화 확대용).
+    mode: 'bilinear' 권장(연속 수치), 'nearest'는 계단형 보존.
+    """
+    t = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
+    if mode in ("bilinear", "bicubic", "trilinear"):
+        t2 = F.interpolate(t, scale_factor=scale, mode=mode, align_corners=False)
+    else:
+        t2 = F.interpolate(t, scale_factor=scale, mode=mode)
+    return t2.squeeze(0).squeeze(0).cpu().numpy()
+
+# =========================================================
+# ★ NEW: disparity를 이미지 위에 overlay하는 유틸
+# =========================================================
+def save_disp_overlay_on_image(
+    path: str,
+    base_bgr_u8: np.ndarray,   # HxWx3, BGR, uint8
+    disp_np: np.ndarray,       # HxW, float
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap_name: str = "magma",
+    alpha: float = 0.6,
+):
+    """
+    base_bgr_u8 위에 disparity colormap을 alpha blending해서 저장.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.cm as cm
+
+    _ensure_dir(os.path.dirname(path))
+
+    H, W, _ = base_bgr_u8.shape
+    arr = np.array(disp_np, dtype=np.float32)
+
+    # disp 크기가 이미지랑 다르면 강제로 맞춤
+    if arr.shape != (H, W):
+        arr = cv2.resize(arr, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    mask = np.isfinite(arr)
+
+    if mask.any():
+        vmin_eff = float(np.nanmin(arr[mask])) if vmin is None else float(vmin)
+        vmax_eff = float(np.nanmax(arr[mask])) if vmax is None else float(vmax)
+        vmax_eff = max(vmax_eff, vmin_eff + 1e-6)
+    else:
+        vmin_eff = 0.0 if vmin is None else float(vmin)
+        vmax_eff = 1.0 if vmax is None else float(vmax)
+
+    norm = (arr - vmin_eff) / (vmax_eff - vmin_eff)
+    norm = np.clip(norm, 0.0, 1.0)
+
+    cmap = cm.get_cmap(cmap_name)
+    color = (cmap(norm)[..., :3] * 255.0).astype(np.uint8)
+    color[~mask] = 0
+
+    base = base_bgr_u8.astype(np.float32)
+    disp_color = color.astype(np.float32)
+    out = (1.0 - float(alpha)) * base + float(alpha) * disp_color
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    cv2.imwrite(path, out)
 
 # =========================================================
 # 체크포인트 로더(다양한 포맷에 견고)
@@ -271,10 +320,6 @@ def load_checkpoint_robust(ckpt_path: str,
                            decoder: torch.nn.Module,
                            device,
                            verbose: bool = True):
-    """
-    - 1순위: tools.resume_from_checkpoint 사용 (학습과 동일 경로)
-    - 실패 시: 다양한 키 패턴('state_dict', 'model', 'ckpt_model', 'stereo/decoder' 등) 자동 감지 로드
-    """
     import types
     import torch
 
@@ -393,13 +438,9 @@ def compute_epe_d1_per_item(
     focal_px: float,
     baseline_m: float,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    EPE(px), D1_all(%) 반환. 유효 GT 없으면 (None, None).
-    """
     valid = (gt_depth_q_m > 0).float()
     if valid.sum() <= 0:
         return None, None
-
     gt_disp_q_px = (float(focal_px) * float(baseline_m)) / gt_depth_q_m.clamp_min(1e-6)
     m = compute_ms2_disparity_metrics(pred_disp_q_px, gt_disp_q_px, valid)
     try:
@@ -414,29 +455,232 @@ def compute_epe_d1_per_item(
     if d1 != d1: d1 = None
     return epe, d1
 
+def compute_epe_d1_per_item_disp(
+    pred_disp_px: torch.Tensor,   # [1,1,H,W], unit: px @ full-res (격자 크기는 H/W 임의)
+    gt_disp_px: torch.Tensor,     # [1,1,H,W], unit: px (full-res)
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    GT가 disparity(px)인 경우 metric 계산.
+    """
+    if gt_disp_px is None:
+        return None, None
+    valid = torch.isfinite(gt_disp_px).float() * (gt_disp_px > 0).float()
+    if valid.sum() <= 0:
+        return None, None
+    m = compute_ms2_disparity_metrics(pred_disp_px, gt_disp_px, valid)
+    epe = float(m.get("EPE", float("nan"))) if isinstance(m, dict) else None
+    d1  = float(m.get("D1_all", float("nan"))) if isinstance(m, dict) else None
+    if epe != epe: epe = None
+    if d1 != d1: d1 = None
+    return epe, d1
+
 # =========================================================
 # disparity gradient (|∂x d|, |∂y d|) 계산 유틸
 # =========================================================
 @torch.no_grad()
 def disparity_gradients_abs(disp: torch.Tensor, keep_size: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    disp: [B,1,H,W] float (px 단위 권장)
-    returns:
-      grad_y_abs: [B,1,H,W] = |∂y d| (세로 방향 변화량의 크기)
-      grad_x_abs: [B,1,H,W] = |∂x d| (가로 방향 변화량의 크기)
-    """
-    # forward difference
-    gx = disp[:, :, :, 1:] - disp[:, :, :, :-1]   # [B,1,H,W-1]
-    gy = disp[:, :, 1:, :] - disp[:, :, :-1, :]   # [B,1,H-1,W]
+    gx = disp[:, :, :, 1:] - disp[:, :, :, :-1]
+    gy = disp[:, :, 1:, :] - disp[:, :, :-1, :]
     grad_x_abs = gx.abs()
     grad_y_abs = gy.abs()
-
     if keep_size:
-        # (left,right,top,bottom) 순서. 우/하 방향으로 한 칸 패딩해 크기 복원.
         grad_x_abs = F.pad(grad_x_abs, (0, 1, 0, 0), mode="replicate")
         grad_y_abs = F.pad(grad_y_abs, (0, 0, 0, 1), mode="replicate")
-
     return grad_y_abs, grad_x_abs
+
+# =========================================================
+# 최종(Stage‑2) argmax(px) 맵 계산 유틸
+# =========================================================
+@torch.no_grad()
+def final_argmax_px_from_pred(pred: dict,
+                              pad_q: Tuple[int, int],
+                              max_disp_px: float,
+                              local_radius: int,
+                              verbose: bool = False) -> Optional[torch.Tensor]:
+    """
+    반환: argmax(px) at 1/4 (shape [B,1,Hq,Wq]) or None
+    우선순위:
+      1) prob_volume_local_1_4 → 로컬 argmax → 전역 재정렬(idx + (d0 - r)) → *4(px)
+      2) logits_1_4_ref(= -logits2) → 위와 동일
+      3) 폴백: prob_volume_1_4 / logits_1_4(= -logits) → 전역 argmax → *4(px)
+    """
+    # --- Stage-2 local volume ---
+    if "prob_volume_local_1_4" in pred and torch.is_tensor(pred["prob_volume_local_1_4"]):
+        prob2 = unpad_last2(pred["prob_volume_local_1_4"], pad_q)       # [B, Dloc, Hq, Wq]
+        idx_local = prob2.argmax(dim=1, keepdim=True).float()           # [B,1,Hq,Wq]
+        if "disp_1_4_stage1" in pred and torch.is_tensor(pred["disp_1_4_stage1"]):
+            d0_cell = unpad_last2(pred["disp_1_4_stage1"], pad_q) / 4.0 # [B,1,Hq,Wq]
+        else:
+            # 안전 폴백: 최종 disp_1_4 존재 시 사용 (완전 일치하진 않음)
+            d0_cell = unpad_last2(pred["disp_1_4"], pad_q) / 4.0
+        r = float(local_radius)
+        idx_abs_cell = idx_local + (d0_cell - r)
+        D_cells = float(max_disp_px) / 4.0
+        idx_abs_cell = idx_abs_cell.clamp(0.0, max(D_cells - 1e-6, 0.0))
+        return idx_abs_cell * 4.0                                       # px
+
+    if "logits_1_4_ref" in pred and torch.is_tensor(pred["logits_1_4_ref"]):
+        lg2 = unpad_last2(pred["logits_1_4_ref"], pad_q)                # [B, Dloc, Hq, Wq] = -logits2
+        idx_local = lg2.argmax(dim=1, keepdim=True).float()
+        if "disp_1_4_stage1" in pred and torch.is_tensor(pred["disp_1_4_stage1"]):
+            d0_cell = unpad_last2(pred["disp_1_4_stage1"], pad_q) / 4.0
+        else:
+            d0_cell = unpad_last2(pred["disp_1_4"], pad_q) / 4.0
+        r = float(local_radius)
+        idx_abs_cell = idx_local + (d0_cell - r)
+        D_cells = float(max_disp_px) / 4.0
+        idx_abs_cell = idx_abs_cell.clamp(0.0, max(D_cells - 1e-6, 0.0))
+        return idx_abs_cell * 4.0
+
+    # --- Fallback: Stage-1 global volume ---
+    if "prob_volume_1_4" in pred and torch.is_tensor(pred["prob_volume_1_4"]):
+        prob = unpad_last2(pred["prob_volume_1_4"], pad_q)              # [B, D, Hq, Wq]
+        idx_cell = prob.argmax(dim=1, keepdim=True).float()             # [B,1,Hq,Wq] (cell)
+        return idx_cell * 4.0                                           # px
+    if "logits_1_4" in pred and torch.is_tensor(pred["logits_1_4"]):
+        lg = unpad_last2(pred["logits_1_4"], pad_q)                     # [B, D, Hq, Wq] = -logits
+        idx_cell = lg.argmax(dim=1, keepdim=True).float()
+        return idx_cell * 4.0
+
+    if verbose:
+        print("[final_argmax] no suitable volume found in pred")
+    return None
+
+# =========================================================
+# GT disparity 로더 (basename 매칭 + 크롭/리사이즈)
+# =========================================================
+def _load_single_disp_gt(path: str,
+                         scale: float) -> Optional[np.ndarray]:
+    """
+    단일 파일에서 disparity(px) 읽기.
+    - 정수형 PNG/TIFF 등 → scale로 나눔(예: 256.0)
+    - float 포맷(.npy/.npz/float PNG 등) → 값 그대로 사용
+    반환: float32 HxW (px), 실패 시 None
+    """
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".npy":
+            arr = np.load(path, allow_pickle=False)
+            arr = np.array(arr, dtype=np.float32)
+            return arr
+        if ext == ".npz":
+            data = np.load(path)
+            # 우선순위 키 탐색
+            for k in ["disp", "disparity", "arr", "data", "depth", "arr_0"]:
+                if k in data:
+                    arr = np.array(data[k], dtype=np.float32)
+                    return arr
+            # 첫 키 사용
+            keys = list(data.keys())
+            if len(keys) > 0:
+                return np.array(data[keys[0]], dtype=np.float32)
+            return None
+        # 이미지 계열
+        from PIL import Image
+        img = Image.open(path)
+        arr = np.array(img)
+        if np.issubdtype(arr.dtype, np.integer):
+            arr = arr.astype(np.float32) / float(scale)
+        else:
+            arr = arr.astype(np.float32)
+        return arr
+    except Exception:
+        return None
+
+def _find_gt_file_for_stem(gt_root: str, name_like: str) -> Optional[str]:
+    """
+    주어진 입력 이미지 이름(name_like)의 stem을 기준으로
+    gt_root 내부에서 같은 stem을 갖는 파일을 탐색.
+    우선순위: .npy > .npz > .png > .tif > .tiff
+    """
+    stem = _basename_wo_ext(name_like)
+    # 1) 루트 바로 아래에서 확장자별 우선 검색
+    exts = [".npy", ".npz", ".png", ".tif", ".tiff"]
+    for ext in exts:
+        cand = os.path.join(gt_root, stem + ext)
+        if os.path.isfile(cand):
+            return cand
+    # 2) 입력 경로 구조를 유지한 상대 경로 시도
+    base_noext = os.path.splitext(name_like)[0]
+    for ext in exts:
+        cand = os.path.join(gt_root, base_noext + ext)
+        if os.path.isfile(cand):
+            return cand
+    # 3) 재귀 검색 (basename 매칭)
+    matches = []
+    for ext in exts:
+        matches.extend(glob.glob(os.path.join(gt_root, "**", stem + ext), recursive=True))
+    if len(matches) > 0:
+        # 확장자 우선순위 정렬
+        def _rank(p):
+            e = os.path.splitext(p)[1].lower()
+            return exts.index(e) if e in exts else 999
+        matches.sort(key=_rank)
+        return matches[0]
+    return None
+
+def _align_to_target_hw(arr: np.ndarray,
+                        target_hw: Tuple[int, int]) -> np.ndarray:
+    """
+    GT 맵을 타깃 해상도(H, W)에 정렬.
+    - (H0>=H and W0>=W)면 좌상단(top-left) 크롭 → 요청 반영
+    - 그 외(확대 포함)에는 최근접/양선형 보간으로 격자에 맞춤 (값 스케일은 유지)
+    """
+    Ht, Wt = int(target_hw[0]), int(target_hw[1])
+    H0, W0 = int(arr.shape[0]), int(arr.shape[1])
+    if H0 == Ht and W0 == Wt:
+        return arr
+
+    if H0 >= Ht and W0 >= Wt:
+        return arr[:Ht, :Wt].copy()
+
+    # 리사이즈 (값 스케일 유지, 단위는 여전히 full-res px)
+    t = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    # disparity는 연속량 → bilinear가 일반적으로 더 자연스러움
+    t2 = F.interpolate(t, size=(Ht, Wt), mode="bilinear", align_corners=False)
+    return t2.squeeze(0).squeeze(0).cpu().numpy()
+
+def load_ms2_gt_disp_batch(
+    names: Union[List[str], Tuple[str, ...], str],
+    gt_disp_dir: str,
+    scale: float,
+    target_hw: Tuple[int, int],
+    device: torch.device
+) -> Optional[torch.Tensor]:
+    """
+    GT disparity(px) 배치를 로드.
+    - 파일 탐색: stem 기반으로 gt_disp_dir 내에서 .npy/.npz/.png/.tif/.tiff 탐색
+    - 정수형 포맷은 `scale`로 나눠 float(px)로 환산
+    - 타깃 해상도에 **좌상단 크롭**을 우선 적용(더 큰 경우)하고,
+      그 외에는 보간으로 맞춤(값 스케일은 유지, 즉 계속 full-res px 단위)
+    """
+    if gt_disp_dir is None:
+        return None
+
+    if isinstance(names, (str,)):
+        name_list = [names]
+    else:
+        name_list = list(names)
+
+    batch = []
+    for nm in name_list:
+        path = _find_gt_file_for_stem(gt_disp_dir, nm)
+        if path is None:
+            # 못 찾으면 invalid로 채움 (모두 0 → valid=0)
+            Ht, Wt = int(target_hw[0]), int(target_hw[1])
+            arr = np.zeros((Ht, Wt), dtype=np.float32)
+        else:
+            arr = _load_single_disp_gt(path, scale=scale)
+            if arr is None:
+                Ht, Wt = int(target_hw[0]), int(target_hw[1])
+                arr = np.zeros((Ht, Wt), dtype=np.float32)
+            else:
+                # HxW로 정렬
+                arr = _align_to_target_hw(arr, target_hw)
+
+        batch.append(torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0))
+
+    return torch.cat(batch, dim=0).to(device, non_blocking=True)
 
 # =========================================================
 # 추론 루프
@@ -470,6 +714,7 @@ def run_inference(args):
     # --- 모델 구성(학습 하이퍼와 동일하게 맞추세요) ---
     stereo = StereoModel(
         freeze_vit=True,
+        cf=args.fused_ch,
         amp=amp_enabled,
         autopad_to_8=False,   # 입력 패딩을 외부에서 처리(학습과 동일)
     ).to(device).eval()
@@ -484,6 +729,9 @@ def run_inference(args):
         local_radius_cells=args.local_radius
     ).to(device).eval()
 
+    # Photometric error용 손실(시각화에 map만 사용)
+    photo_crit = PhotometricLoss([args.photo_l1_w, args.photo_ssim_w])
+
     # --- 가중치 로드 ---
     if args.ckpt is None or not os.path.isfile(args.ckpt):
         raise FileNotFoundError(f"--ckpt 경로가 올바르지 않습니다: {args.ckpt}")
@@ -497,8 +745,14 @@ def run_inference(args):
     out_disp_qpx_px = _ensure_dir(os.path.join(out_root, "disp_1_4_px"))
     out_disp_full_px = _ensure_dir(os.path.join(out_root, "disp_full_px"))
     out_depth_m = _ensure_dir(os.path.join(out_root, "depth_m")) if (args.focal_px > 0 and args.baseline_m > 0) else None
-    out_vis = _ensure_dir(os.path.join(out_root, "vis"))  # 시각화 폴더
-    out_error = _ensure_dir(os.path.join(out_root, "error"))  # 시각화 폴더
+    out_vis = _ensure_dir(os.path.join(out_root, "vis"))          # 시각화 폴더
+    out_error = _ensure_dir(os.path.join(out_root, "error"))      # EPE 시각화 폴더
+    out_pth   = _ensure_dir(os.path.join(out_root, "photometric_error"))  # Photometric error 폴더
+    out_arg   = _ensure_dir(os.path.join(out_root, "argmax_1_4"))         # 최종 argmax(1/4) 폴더
+
+    # ★ NEW: 디버그용 이미지 / overlay 폴더
+    out_dbg_imgL    = _ensure_dir(os.path.join(out_root, "debug_imgL"))
+    out_dbg_overlay = _ensure_dir(os.path.join(out_root, "debug_overlay"))
 
     # --- metrics 로깅 CSV (선택)
     metrics_csv_path = os.path.join(out_root, "metrics_per_image.csv")
@@ -510,10 +764,21 @@ def run_inference(args):
     torch.set_grad_enabled(False)
     context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
 
+    # 어떤 GT를 쓸지 결정
+    use_gt_disp = args.gt_disp_dir is not None
+    if use_gt_disp and (args.gt_depth_dir is not None) and args.verbose:
+        print("[GT] --gt_disp_dir과 --gt_depth_dir이 모두 주어졌습니다. disparity GT를 우선 사용합니다.")
+
+    has_fb = (args.focal_px > 0.0 and args.baseline_m > 0.0)
+
     with context():
         for it, (imgL, imgR, names) in enumerate(loader, start=1):
             imgL = imgL.to(device, non_blocking=True)  # ImageNet 정규화 가정
             imgR = imgR.to(device, non_blocking=True)
+
+            # Photometric용 [0,1] 복원
+            imgL_01 = denorm_imagenet(imgL)
+            imgR_01 = denorm_imagenet(imgR)
 
             # 1) 입력 ×16 패딩
             imgL_pad, pad = pad_to_multiple(imgL, mult=16, mode="replicate")
@@ -522,9 +787,9 @@ def run_inference(args):
 
             # 2) 모델 추론
             with torch.cuda.amp.autocast(enabled=amp_enabled):
+                
                 bb_out = stereo(imgL_pad, imgR_pad)
                 pred   = decoder(bb_out)
-
                 # 3) 출력 언패드 — 모두 1/4 해상도 좌표계
                 pad_q = (pad[0] // 4, pad[1] // 4)
 
@@ -539,12 +804,37 @@ def run_inference(args):
                 else:
                     disp_full_px = F.interpolate(disp_q_full_px, scale_factor=4, mode="bilinear", align_corners=False)
 
+                # === NEW: 최종(Stage-2) argmax(px) 맵 @1/4 ===
+                argmax_px_q = final_argmax_px_from_pred(
+                    pred=pred, pad_q=pad_q, max_disp_px=float(args.max_disp_px),
+                    local_radius=int(args.local_radius), verbose=args.verbose
+                )  # [B,1,Hq,Wq] or None
+
             Bsz = disp_q_full_px.shape[0]
-            # 4) (선택) GT depth 로딩 -> per-image metrics 계산
+
+            # 4) (선택) GT 로딩 -> per-image metrics 계산
             gt_depth_q = None
             gt_depth = None
-            has_fb = (args.focal_px > 0.0 and args.baseline_m > 0.0)
-            if args.gt_depth_dir is not None:
+            gt_disp_q = None
+            gt_disp = None
+
+            if use_gt_disp:
+                gt_disp_q = load_ms2_gt_disp_batch(
+                    names=names,
+                    gt_disp_dir=args.gt_disp_dir,
+                    scale=args.gt_disp_scale,
+                    target_hw=disp_q_full_px.shape[-2:],  # (Hq, Wq)
+                    device=imgL.device
+                )
+                gt_disp = load_ms2_gt_disp_batch(
+                    names=names,
+                    gt_disp_dir=args.gt_disp_dir,
+                    scale=args.gt_disp_scale,
+                    target_hw=disp_full_px.shape[-2:],     # (H, W)
+                    device=imgL.device
+                )
+            elif args.gt_depth_dir is not None:
+                # 기존 depth GT 경로
                 gt_depth_q = load_ms2_gt_depth_batch(
                     names=names,
                     gt_depth_dir=args.gt_depth_dir,
@@ -552,7 +842,6 @@ def run_inference(args):
                     target_hw=disp_q_full_px.shape[-2:],  # (Hq, Wq)
                     device=imgL.device
                 )
-            if args.gt_depth_dir is not None:
                 gt_depth = load_ms2_gt_depth_batch(
                     names=names,
                     gt_depth_dir=args.gt_depth_dir,
@@ -571,11 +860,32 @@ def run_inference(args):
                 disp_q_full_px_np = disp_q_full_px[bi, 0].detach().cpu().numpy()
                 disp_full_px_np   = disp_full_px[bi, 0].detach().cpu().numpy()
 
+                # ★ NEW: 이 disparity가 실제로 만들어진 left 이미지 자체를 저장
+                imgL01_np = imgL_01[bi].detach().cpu().permute(1, 2, 0).numpy()  # H,W,3 [0,1]
+                imgL01_np = np.clip(imgL01_np, 0.0, 1.0)
+                imgL_u8 = (imgL01_np * 255.0).astype(np.uint8)                   # RGB
+                imgL_bgr = cv2.cvtColor(imgL_u8, cv2.COLOR_RGB2BGR)
+
+                debug_img_path = os.path.join(out_dbg_imgL, f"{stem}_left_used.png")
+                cv2.imwrite(debug_img_path, imgL_bgr)
+
+                # ★ NEW: 이 left_used에 disp_full_px를 바로 overlay
+                debug_overlay_path = os.path.join(out_dbg_overlay, f"{stem}_disp_overlay.png")
+                vmax_disp = args.vmax if args.vmax is not None else args.max_disp_px
+                save_disp_overlay_on_image(
+                    debug_overlay_path,
+                    imgL_bgr,
+                    disp_full_px_np,
+                    vmin=0.0,
+                    vmax=vmax_disp,
+                    cmap_name=args.disp_cmap,
+                    alpha=args.overlay_alpha,
+                )
+
                 # 5-1) *.npy 저장
                 if args.save_npy:
-                    save_npy(os.path.join(out_disp_qpx,     f"{stem}.npy"), disp_q_qpx_np)
-                    save_npy(os.path.join(out_disp_qpx_px,  f"{stem}.npy"), disp_q_full_px_np)
                     save_npy(os.path.join(out_disp_full_px, f"{stem}.npy"), disp_full_px_np)
+                    save_npy(os.path.join(out_disp_qpx_px, f"{stem}.npy"), disp_q_qpx_np)
 
                 # 5-2) 16-bit PNG(선택)
                 if args.save_png16:
@@ -589,16 +899,21 @@ def run_inference(args):
                         torch.from_numpy(disp_full_px_np).unsqueeze(0).unsqueeze(0),
                         float(args.focal_px), float(args.baseline_m)
                     ).squeeze(0).squeeze(0).numpy()
-                    if args.save_npy:
-                        save_npy(os.path.join(out_depth_m, f"{stem}.npy"), depth_m_np)
-                    if args.save_png16:
-                        save_png_16u(os.path.join(out_depth_m, f"{stem}.png"), depth_m_np, scale=float(args.depth_png16_scale))
+                    # 필요 시 depth 저장/시각화 로직을 추가하세요.
 
                 # 5-4) 시각화 PNG (disparity/깊이 + 오버레이)
                 epe_full, d1_full = None, None
                 text_overlay = None
                 text_overlay_q = None
-                if gt_depth_q is not None and has_fb:
+
+                # --- 1/4 해상도 metric 텍스트 ---
+                if use_gt_disp and (gt_disp_q is not None):
+                    epe_q, d1_q = compute_epe_d1_per_item_disp(
+                        pred_disp_px=disp_q_full_px[bi:bi+1],
+                        gt_disp_px=gt_disp_q[bi:bi+1],
+                    )
+                    text_overlay_q = f"EPE 1/4 {epe_q:.3f} px | D1 1/4 {d1_q:.2f}%" if (epe_q is not None and d1_q is not None) else "EPE/D1 1/4 : N/A"
+                elif (gt_depth_q is not None) and has_fb:
                     epe_q, d1_q = compute_epe_d1_per_item(
                         pred_disp_q_px=disp_q_full_px[bi:bi+1],
                         gt_depth_q_m=gt_depth_q[bi:bi+1],
@@ -609,38 +924,60 @@ def run_inference(args):
                 elif args.overlay_always:
                     text_overlay_q = "EPE/D1 1/4 : N/A"
 
-                if (gt_depth is not None) and has_fb:
+                # --- full 해상도 metric 텍스트 ---
+                if use_gt_disp and (gt_disp is not None):
+                    epe_full, d1_full = compute_epe_d1_per_item_disp(
+                        pred_disp_px=disp_full_px[bi:bi+1],
+                        gt_disp_px=gt_disp[bi:bi+1],
+                    )
+                    text_overlay = f"EPE {epe_full:.3f} px | D1 {d1_full:.2f}%" if (epe_full is not None and d1_full is not None) else "EPE/D1 : N/A"
+                elif (gt_depth is not None) and has_fb:
                     epe_full, d1_full = compute_epe_d1_per_item(
                         pred_disp_q_px=disp_full_px[bi:bi+1],
                         gt_depth_q_m=gt_depth[bi:bi+1],
                         focal_px=float(args.focal_px),
                         baseline_m=float(args.baseline_m),
                     )
-                    text_overlay = f"EPE {epe_full:.3f} px | D1 {d1_full:.2f}%" if (epe_full is not None and d1_full is not None) else "EPE/D1 : N/A"
+                    text_overlay = f"EPE {epe_full:.3f} px | D1 {d1_full:.2f}%"
                 elif args.overlay_always:
                     text_overlay = "EPE/D1 : N/A"
 
                 # disparity 시각화 저장
                 if args.save_color:
-                    # 1/4 해상도(px) 보조 시각화
+                    # 1/4 해상도(q‑px) 보조 시각화 (공간 ×4 확대)
                     p2_q = os.path.join(out_disp_qpx_px, f"{stem}_disp_1_4_px.png")
-                    save_colormap_png(p2_q, disp_q_full_px_np, vmax=args.vmax)
+                    save_colormap_png(p2_q, upsample_np(disp_q_qpx_np, scale=4, mode="bilinear"),
+                                      vmax=args.max_disp_px / 4.0, cmap_name=args.disp_cmap)
                     if text_overlay_q:
                         annotate_png_top_left(p2_q, text_overlay_q)
 
-                    # full-res(px) 기본 컬러맵
-                    # p2 = os.path.join(out_disp_full_px, f"{stem}_disp_px.png")
-                    # save_colormap_png(p2, disp_full_px_np, vmax=args.vmax)
-                    # if text_overlay:
-                    #     annotate_png_top_left(p2, text_overlay)
+                    # === NEW: 최종(Stage-2) argmax(px) 저장 (공간 ×4 확대) ===
+                    if argmax_px_q is not None:
+                        arg_px_np = argmax_px_q[bi, 0].detach().cpu().numpy()             # px @1/4
+                        arg_px_np_up = upsample_np(arg_px_np, scale=4, mode="bilinear")    # 보기용 확대
 
-                    # === NEW: full-res(px) + colorbar 버전 추가 저장 ===
+                        # (2) 컬러바 포함
+                        p_arg_cb = os.path.join(out_arg, f"{stem}_argmax_1_4_px_cb.png")
+                        save_colormap_png_with_colorbar_auto_range(
+                            p_arg_cb,
+                            arg_px_np_up,
+                            vmin=0.0, vmax=args.max_disp_px,
+                            cmap_name=args.disp_cmap,
+                            label="Argmax Stage-2 (px)",
+                            bg_color=args.disp_bg_color
+                        )
+                        annotate_png_top_left(p_arg_cb, "Argmax Stage-2 (px)" + (f"  |  {text_overlay_q}" if text_overlay_q else ""))
+
+                        if args.save_npy:
+                            save_npy(os.path.join(out_arg, f"{stem}_argmax_1_4_px.npy"), arg_px_np)
+
+                    # === full-res(px) + colorbar 버전 저장 ===
                     p2_cb = os.path.join(out_disp_full_px, f"{stem}_disp_px_cb.png")
                     save_colormap_png_with_colorbar_auto_range(
                         p2_cb,
                         disp_full_px_np,
-                        vmin=None,                      # 데이터 min 자동
-                        vmax=args.vmax,                 # 사용자가 지정하면 적용
+                        vmin=None,
+                        vmax=args.max_disp_px,
                         cmap_name=args.disp_cmap,
                         label="Disparity (px)",
                         bg_color=args.disp_bg_color
@@ -648,7 +985,7 @@ def run_inference(args):
                     if text_overlay:
                         annotate_png_top_left(p2_cb, text_overlay)
 
-                # === NEW: disparity gradient 시각화 저장 ===
+                # === disparity gradient 시각화 저장 ===
                 if args.save_color and args.save_disp_grads:
                     if args.grad_on in ("full", "both"):
                         disp_full_curr = disp_full_px[bi:bi+1]  # [1,1,H,W]
@@ -661,9 +998,6 @@ def run_inference(args):
                         save_colormap_png(pvx, gx_full_np, vmax=args.vmax_grad)
                         annotate_png_top_left(pvy, "Vertical |∂y disp|")
                         annotate_png_top_left(pvx, "Horizontal |∂x disp|")
-                        if args.save_npy:
-                            save_npy(os.path.join(out_vis, f"{stem}_gradV_full.npy"), gy_full_np)
-                            save_npy(os.path.join(out_vis, f"{stem}_gradH_full.npy"), gx_full_np)
 
                     if args.grad_on in ("q", "both"):
                         disp_q_curr = disp_q_full_px[bi:bi+1]  # [1,1,Hq,Wq]
@@ -676,29 +1010,16 @@ def run_inference(args):
                         save_colormap_png(pvx_q, gx_q_np, vmax=args.vmax_grad)
                         annotate_png_top_left(pvy_q, "Vertical |∂y disp| @1/4")
                         annotate_png_top_left(pvx_q, "Horizontal |∂x disp| @1/4")
-                        if args.save_npy:
-                            save_npy(os.path.join(out_vis, f"{stem}_gradV_1_4.npy"), gy_q_np)
-                            save_npy(os.path.join(out_vis, f"{stem}_gradH_1_4.npy"), gx_q_np)
 
-                # --- Error maps (GT가 있고 fx/B가 있을 때) ---
-                if (gt_depth is not None) and has_fb:
-                    # 유효 mask (full-res)
-                    valid_full = (gt_depth[bi:bi+1] > 0).float()  # [1,1,H,W]
-
-                    # GT disparity(px@full-res)
-                    gt_disp_full_px = (float(args.focal_px) * float(args.baseline_m)) / \
-                                      torch.clamp(gt_depth[bi:bi+1], min=1e-6)  # [1,1,H,W]
-
-                    # EPE map (px) — FULL RES 직접 계산
-                    epe_map_full = torch.abs(disp_full_px[bi:bi+1] - gt_disp_full_px) * valid_full  # [1,1,H,W]
-
-                    # numpy 변환
+                # --- Error maps (GT가 있을 때) ---
+                if use_gt_disp and (gt_disp is not None):
+                    valid_full = (gt_disp[bi:bi+1] > 0).float() * torch.isfinite(gt_disp[bi:bi+1]).float()
+                    epe_map_full = torch.abs(disp_full_px[bi:bi+1] - gt_disp[bi:bi+1]) * valid_full  # [1,1,H,W]
                     epe_map_full_np  = epe_map_full.squeeze(0).squeeze(0).detach().cpu().numpy()
 
                     if args.save_npy:
                         save_npy(os.path.join(out_vis, f"{stem}_err_epe_full_px.npy"), epe_map_full_np)
 
-                    # === error map + colorbar 저장(진한 배경) ===
                     if args.save_color:
                         vmax_err = args.vmax_err if (args.vmax_err is not None and args.vmax_err > 0) else None
                         p_err_full_png = os.path.join(out_error, f"{stem}_error map.png")
@@ -706,12 +1027,62 @@ def run_inference(args):
                             p_err_full_png,
                             epe_map_full_np,
                             vmax=vmax_err,
-                            cmap_name=args.err_cmap,   # <- 선택 컬러맵
+                            cmap_name=args.err_cmap,
                             label="EPE (px)",
-                            bg_color=args.err_bg_color # <- 진한 배경
+                            bg_color=args.err_bg_color
                         )
                         if text_overlay:
                             annotate_png_top_left(p_err_full_png, text_overlay)
+
+                elif (gt_depth is not None) and has_fb:
+                    valid_full = (gt_depth[bi:bi+1] > 0).float()  # [1,1,H,W]
+                    gt_disp_full_px = (float(args.focal_px) * float(args.baseline_m)) / \
+                                      torch.clamp(gt_depth[bi:bi+1], min=1e-6)  # [1,1,H,W]
+                    epe_map_full = torch.abs(disp_full_px[bi:bi+1] - gt_disp_full_px) * valid_full  # [1,1,H,W]
+                    epe_map_full_np  = epe_map_full.squeeze(0).squeeze(0).detach().cpu().numpy()
+
+                    if args.save_npy:
+                        save_npy(os.path.join(out_vis, f"{stem}_err_epe_full_px.npy"), epe_map_full_np)
+
+                    if args.save_color:
+                        vmax_err = args.vmax_err if (args.vmax_err is not None and args.vmax_err > 0) else None
+                        p_err_full_png = os.path.join(out_error, f"{stem}_error map.png")
+                        save_colormap_png_with_colorbar(
+                            p_err_full_png,
+                            epe_map_full_np,
+                            vmax=vmax_err,
+                            cmap_name=args.err_cmap,
+                            label="EPE (px)",
+                            bg_color=args.err_bg_color
+                        )
+                        if text_overlay:
+                            annotate_png_top_left(p_err_full_png, text_overlay)
+
+                # --- Photometric error map 저장 ---
+                if args.save_color:
+                    imgL_b = imgL_01[bi:bi+1]
+                    imgR_b = imgR_01[bi:bi+1]
+                    imgR_warp, valid_w = warp_right_to_left_image(imgR_b, disp_full_px[bi:bi+1])
+                    pth_map = photo_crit.simple_photometric_loss(
+                        imgL_b, imgR_warp,
+                        weights=[args.photo_l1_w, args.photo_ssim_w]
+                    )  # [1,1,H,W] 가정
+
+                    pth_map_np = pth_map.squeeze(0).squeeze(0).detach().cpu().numpy()
+                    valid_w_np = valid_w.squeeze(0).squeeze(0).detach().cpu().numpy().astype(bool)
+                    pth_map_np[~valid_w_np] = np.nan
+
+                    p_pth_png = os.path.join(out_pth, f"{stem}_pth_error.png")
+                    save_colormap_png_with_colorbar(
+                        p_pth_png,
+                        pth_map_np,
+                        vmax=None,                  # 99th percentile 자동
+                        cmap_name=args.err_cmap,    # 에러맵과 동일 팔레트 사용
+                        label="Photometric error",
+                        bg_color=args.err_bg_color
+                    )
+                    if args.save_npy:
+                        save_npy(os.path.join(out_pth, f"{stem}_pth_error.npy"), pth_map_np)
 
                 # CSV 로깅
                 if metrics_csv_fp is not None:
@@ -732,7 +1103,7 @@ def run_inference(args):
 # argparse
 # =========================================================
 def get_args():
-    p = argparse.ArgumentParser("Stereo Inference — pad ×16, outputs unpadded @1/4 + full-res, per-image EPE/D1 overlay + error maps (with colorbar & dark bg)")
+    p = argparse.ArgumentParser("Stereo Inference — pad ×16, outputs unpadded @1/4 + full-res, per-image EPE/D1 overlay + error maps, FINAL Stage-2 argmax saving")
 
     # 데이터
     p.add_argument("--left_dir",  type=str, required=True)
@@ -743,13 +1114,13 @@ def get_args():
     p.add_argument("--workers",    type=int, default=4)
 
     # 모델/디코더 (학습과 동일하게 맞춰야 정확)
-    p.add_argument("--max_disp_px", type=int, default=56)
-    p.add_argument("--fused_ch",    type=int, default=320)
+    p.add_argument("--max_disp_px", type=int, default=28)
+    p.add_argument("--fused_ch",    type=int, default=512)
     p.add_argument("--acv_red_ch",  type=int, default=128)
     p.add_argument("--agg_ch",      type=int, default=128)
     p.add_argument("--use_motif",   type=bool, default=True)
     p.add_argument("--two_stage",   type=bool, default=True)
-    p.add_argument("--local_radius", type=int, default=0)
+    p.add_argument("--local_radius", type=int, default=8)
 
     # 실행
     p.add_argument("--ckpt",       type=str, required=True, help="학습에서 저장한 .pth")
@@ -766,9 +1137,17 @@ def get_args():
     p.add_argument("--save_color",  action="store_true", help="컬러맵 PNG 시각화 저장")
     p.add_argument("--vmax",        type=float, default=None, help="disparity 시각화 상한(px)")
     p.add_argument("--vmax_depth",  type=float, default=None, help="depth 시각화 상한(m)")
-    p.add_argument("--vmax_err",    type=float, default=None, help="EPE heatmap 시각화 상한(px)")
+    p.add_argument("--vmax_err",    type=float, default=6.0, help="EPE heatmap 시각화 상한(px)")
     p.add_argument("--write_csv",   action="store_true", help="per-image EPE/D1 CSV 저장")
     p.add_argument("--overlay_always", action="store_true", help="GT 없을 때도 'N/A' 오버레이")
+
+    # ★ NEW: overlay 강도 조절
+    p.add_argument(
+        "--overlay_alpha",
+        type=float,
+        default=0.85,
+        help="debug overlay 강도 (0.0=안보임, 1.0=컬러맵만 보임)",
+    )
 
     # 캘리브(자동/수동)
     p.add_argument("--calib_npy", type=str, default=None)
@@ -776,9 +1155,13 @@ def get_args():
     p.add_argument("--focal_px", type=float, default=764.5138549804688)
     p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
 
-    # per-image metrics용 GT depth
+    # per-image metrics용 GT depth (선택)
     p.add_argument("--gt_depth_dir",  type=str, default=None, help="GT depth root 디렉토리(파일명 기준 매칭)")
     p.add_argument("--gt_depth_scale", type=float, default=256.0, help="GT depth 스케일(예: 256.0)")
+
+    # === NEW: per-image metrics용 GT disparity (선택) ===
+    p.add_argument("--gt_disp_dir",  type=str, default=None, help="GT disparity root 디렉토리(파일명 기준 매칭). 주어지면 depth 대신 이것으로 metric 계산")
+    p.add_argument("--gt_disp_scale", type=float, default=256.0, help="정수형 GT disparity 스케일(예: 256.0). float 파일은 스케일 적용 안 함")
 
     # --- disparity gradient 저장 옵션 ---
     p.add_argument("--save_disp_grads", action="store_true",
@@ -788,17 +1171,21 @@ def get_args():
     p.add_argument("--vmax_grad", type=float, default=None,
                    help="gradient 히트맵 컬러 상한(px/pixel). None이면 이미지별 min-max 자동")
 
-    # --- NEW: error map 시각화 옵션 ---
+    # --- error/photometric 시각화 옵션 ---
     p.add_argument("--err_bg_color", type=str, default="#1e1e1e",
                    help="에러맵 배경색 (예: '#1e1e1e', 'black', '#f0f0f0')")
     p.add_argument("--err_cmap", type=str, default="magma",
                    help="에러맵 컬러맵 이름(예: 'magma', 'inferno', 'viridis', 'plasma')")
 
-    # --- NEW: disparity 컬러바 시각화 옵션 ---
+    # --- disparity 컬러바 시각화 옵션 ---
     p.add_argument("--disp_bg_color", type=str, default="#1e1e1e",
                    help="disparity 컬러맵 배경색(유효하지 않은 픽셀 표현)")
     p.add_argument("--disp_cmap", type=str, default="magma",
                    help="disparity 컬러맵 이름(예: 'magma', 'inferno', 'viridis', 'plasma')")
+
+    # --- Photometric 가중치 (학습과 동일 기본값) ---
+    p.add_argument("--photo_l1_w",   type=float, default=0.15)
+    p.add_argument("--photo_ssim_w", type=float, default=0.85)
 
     return p.parse_args()
 

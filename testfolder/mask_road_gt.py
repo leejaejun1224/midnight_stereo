@@ -19,6 +19,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
+import cv2
+
 # ===========================================
 # 0) DINO 로드 & 전처리
 # ===========================================
@@ -28,9 +30,9 @@ IMG_EXTS = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
 
 def load_dino(device: torch.device):
     """
-    facebookresearch/dino 의 ViT-S/8(dino_vits8) 로드
+    facebookresearch/dino 의 ViT-S/8(dino_vitb8) 로드
     """
-    model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
+    model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
     model.eval().to(device)
     return model
 
@@ -98,12 +100,10 @@ def build_quarter_features(model, img_tensor: torch.Tensor) -> torch.Tensor:
     """
     device = next(model.parameters()).device
     img_tensor = img_tensor.to(device, non_blocking=True)
-
     _, _, H, W = img_tensor.shape
     assert H % 8 == 0 and W % 8 == 0, "입력 H,W는 8의 배수여야 합니다. (--pad_to_8 권장)"
 
     H4, W4 = H // 4, W // 4
-
     f00 = _shift_once(model, img_tensor, dx=0, dy=0)  # [H8,W8,C]
     f40 = _shift_once(model, img_tensor, dx=4, dy=0)
     f04 = _shift_once(model, img_tensor, dx=0, dy=4)
@@ -357,6 +357,25 @@ def upsample_nearest_4x(map_2d: np.ndarray) -> np.ndarray:
     """
     return np.kron(map_2d, np.ones((4, 4), dtype=map_2d.dtype))
 
+def pixelate_keep_shape(arr: np.ndarray, block: int = 4) -> np.ndarray:
+    """
+    GT disparity를 "점(픽셀)" 크게 보이게 하는 용도.
+    - 출력 shape(H,W)는 그대로 유지
+    - downsample(nearest) -> upsample(nearest)
+    """
+    if block is None or int(block) <= 1:
+        return arr.astype(np.float32)
+
+    block = int(block)
+    H, W = arr.shape
+    h2 = max(1, H // block)
+    w2 = max(1, W // block)
+
+    t = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    small = F.interpolate(t, size=(h2, w2), mode="nearest")
+    big   = F.interpolate(small, size=(H, W), mode="nearest")[0, 0].cpu().numpy()
+    return big.astype(np.float32)
+
 def _get_transparent_disp_cmap():
     # turbo가 없거나 with_extremes 미지원 대비
     try:
@@ -382,6 +401,9 @@ def _ensure_dirs(root: Path, *names: str) -> Dict[str, Path]:
 
 def _save_map(path: Path, arr: np.ndarray, vmin=None, vmax=None, title=None,
               cmap="viridis", with_colorbar=True, overlay_img: np.ndarray=None, alpha=0.55):
+    """
+    (overlay가 필요한 경우에만 사용하는 기본 시각화 함수)
+    """
     plt.figure(figsize=(7,7))
     if overlay_img is not None:
         plt.imshow(overlay_img)
@@ -391,11 +413,58 @@ def _save_map(path: Path, arr: np.ndarray, vmin=None, vmax=None, title=None,
     plt.axis("off")
     if title: plt.title(title)
     if with_colorbar:
-        cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
-        # 라벨은 호출부에서 설정
+        _ = plt.colorbar(im, fraction=0.046, pad=0.04)
     plt.tight_layout()
     plt.savefig(str(path), bbox_inches="tight", pad_inches=0.01)
     plt.close()
+
+def save_colormap_png_with_colorbar_auto_range(
+    path,
+    np_array,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap_name: str = "magma",
+    label: str = "",
+    bg_color: str = "#1e1e1e",
+):
+    """
+    두 번째 코드와 동일한 스타일의 시각화 (배경 어두운 회색 + colorbar).
+    """
+    from matplotlib.colors import ListedColormap, to_rgba
+
+    path = str(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    arr = np.array(np_array, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        vmin_eff = 0.0 if vmin is None else float(vmin)
+        vmax_eff = 1.0 if vmax is None else float(vmax)
+    else:
+        vmin_eff = float(np.nanmin(arr[finite])) if vmin is None else float(vmin)
+        vmax_eff = float(np.nanmax(arr[finite])) if vmax is None else float(vmax)
+        vmax_eff = max(vmax_eff, vmin_eff + 1e-6)
+
+    base = plt.get_cmap(cmap_name)
+    cmap = ListedColormap(base(np.linspace(0, 1, 256)))
+    cmap.set_bad(to_rgba(bg_color))
+
+    H, W = arr.shape
+    dpi = 200.0
+    figsize = (W / dpi, H / dpi)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor(bg_color)
+    ax.set_facecolor(bg_color)
+    im = ax.imshow(arr, cmap=cmap, vmin=vmin_eff, vmax=vmax_eff)
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if label:
+        cbar.set_label(label, rotation=270, labelpad=12)
+
+    plt.tight_layout(pad=0.1)
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.1, facecolor=fig.get_facecolor())
+    plt.close(fig)
 
 # -------------------------------------------
 # GT 로딩 / 변환 (depth→disp or disp 원본)
@@ -445,18 +514,89 @@ def load_gt_disp_px(gt_path: Path, mode: str, depth_scale: float, disp_scale: fl
     return disp_px.astype(np.float32)
 
 # -------------------------------------------
+# GT 다운샘플 (full-res px -> 1/4-grid, cell 단위)
+# -------------------------------------------
+def downsample_disp_to_quarter_cell(disp_px: np.ndarray) -> np.ndarray:
+    """
+    full-res disparity(px) [H,W] -> 1/4-grid disparity(cell units) [H/4,W/4]
+    - 4x4 블록 내 유효 픽셀만 nanmean으로 평균
+    - px 단위에서 4로 나눠 '셀 단위 disparity'로 변환
+    """
+    H, W = disp_px.shape
+    assert H % 4 == 0 and W % 4 == 0, "GT disparity H,W must be divisible by 4 for quarter resolution."
+    H4, W4 = H // 4, W // 4
+
+    # [H4, 4, W4, 4]
+    disp_block = disp_px.reshape(H4, 4, W4, 4)
+
+    # 4x4 블록 내 nanmean
+    disp_block_px = np.nanmean(np.nanmean(disp_block, axis=3), axis=1)  # [H4,W4]
+
+    # px -> cell units
+    disp_block_cell = disp_block_px / 4.0
+    return disp_block_cell.astype(np.float32)
+
+# -------------------------------------------
+# 1/4-grid 에서 EPE / D1 계산
+# -------------------------------------------
+def compute_epe_d1_quarter(
+    pred_cell: np.ndarray,
+    gt_cell: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+):
+    """
+    1/4-grid (cell units)에서 EPE와 D1 계산.
+    - pred_cell, gt_cell: [H4,W4], disparity in 'cell units'
+    - valid_mask: 평가에 포함할 픽셀 (예: pseudo-label 마스크). None이면 GT valid만 사용.
+    - EPE: cell 단위 절대 오차 평균
+    - D1: (KITTI 기준 3px, 5%)를 cell 단위로 환산하여 적용.
+          (3px ≈ 0.75 cell 로 간주)
+    """
+    assert pred_cell.shape == gt_cell.shape, "pred/gt must share shape"
+
+    gt_valid = np.isfinite(gt_cell) & (gt_cell > 0.0)
+    if valid_mask is not None:
+        valid = gt_valid & valid_mask
+    else:
+        valid = gt_valid
+
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        return float("nan"), float("nan"), 0, 0.0, 0
+
+    pred = pred_cell.astype(np.float32)
+    gt   = gt_cell.astype(np.float32)
+
+    diff = (pred - gt)[valid]  # cell units
+    abs_diff = np.abs(diff)    # cell units
+
+    # EPE (cell units)
+    sum_abs = float(abs_diff.sum())
+    epe = sum_abs / n_valid
+
+    # D1: |err| > 3px & |err| / gt > 0.05
+    tau_abs_cell = 3.0 / 4.0
+    gt_valid_vals = gt[valid]  # cell units
+    bad = (abs_diff > tau_abs_cell) & (abs_diff / gt_valid_vals > 0.05)
+    bad_count = int(bad.sum())
+    d1 = bad_count / n_valid
+
+    return epe, d1, n_valid, sum_abs, bad_count
+
+# -------------------------------------------
 # 개별 PNG로 저장 (pred/gt/error/entropy 등)
 # -------------------------------------------
 def save_cmp_panels_separate(
     left_img_pil: Image.Image,
     disp_pred_cell: np.ndarray,   # [H4,W4] in 1/4-cell units
-    fill_mask_q: np.ndarray,      # [H4,W4] bool (ROI∩invalid)
+    fill_mask_q: np.ndarray,      # [H4,W4] bool
     disp_gt_px_full: np.ndarray,  # [H,W] in px (NaN 허용)
     ent_before_q: np.ndarray,     # [H4,W4] (0..1)
     ent_after_q: np.ndarray,      # [H4,W4] (0..1)
     max_disp_cell: int,
     out_root: Path,
-    stem: str
+    stem: str,
+    gt_viz_block: int = 4,        # ✅ GT 점 크기(블록) 키우기용
 ):
     out = _ensure_dirs(
         out_root,
@@ -468,68 +608,71 @@ def save_cmp_panels_separate(
     img_np = np.asarray(left_img_pil)
 
     # Pred @ full-res(px) + Fill-mask 업샘플
-    disp_pred_px_full = upsample_nearest_4x(disp_pred_cell).astype(np.float32) * 4.0  # [H,W]
-    mask_full = upsample_nearest_4x(fill_mask_q.astype(np.uint8)).astype(bool)        # [H,W]
+    disp_pred_px_full = upsample_nearest_4x(disp_pred_cell).astype(np.float32)  # [H,W]
+    mask_full = upsample_nearest_4x(fill_mask_q.astype(np.uint8)).astype(bool)  # [H,W]
 
     # Entropy upsample to full-res (보기 편하게)
     ent_b_full = upsample_nearest_4x(ent_before_q).astype(np.float32)  # [H,W], 0..1
     ent_a_full = upsample_nearest_4x(ent_after_q).astype(np.float32)
 
     # 스케일
-    vmax_px = float(max_disp_cell * 4)
+    vmax_px = float(max_disp_cell)
     cmap_disp = _get_transparent_disp_cmap()
 
     # 1) Pred overlay (전체)
     p = out["pred_overlay_all"] / f"{stem}.png"
     _save_map(p, disp_pred_px_full, vmin=0, vmax=vmax_px, title=None,
               cmap=cmap_disp, with_colorbar=True, overlay_img=img_np, alpha=0.55)
-    # colorbar 라벨 변경
-    # (matplotlib 객체 핸들을 재사용하지 않으므로 간단화를 위해 라벨은 생략)
-
-    # 2) Pred overlay (filled만)
-    pred_vis_filled = np.where(mask_full, disp_pred_px_full, np.nan)
-    p = out["pred_overlay_filled"] / f"{stem}.png"
-    _save_map(p, pred_vis_filled, vmin=0, vmax=vmax_px, title=None,
-              cmap=cmap_disp, with_colorbar=True, overlay_img=img_np, alpha=0.55)
-
-    # 3) GT overlay
-    gt_vis = np.where(np.isfinite(disp_gt_px_full), disp_gt_px_full, np.nan)
-    p = out["gt_overlay"] / f"{stem}.png"
-    _save_map(p, gt_vis, vmin=0, vmax=vmax_px, title=None,
-              cmap=cmap_disp, with_colorbar=True, overlay_img=img_np, alpha=0.55)
 
     # 4) Pred disp(px)
     p = out["pred_disp_px"] / f"{stem}.png"
-    _save_map(p, disp_pred_px_full, vmin=0, vmax=vmax_px, title=None,
-              cmap=cmap_disp, with_colorbar=True)
+    save_colormap_png_with_colorbar_auto_range(
+        p,
+        disp_pred_px_full,
+        vmin=0.0,
+        vmax=vmax_px,
+        cmap_name="magma",
+        label="Pred disparity (px)",
+        bg_color="#1e1e1e",
+    )
 
-    # 5) GT disp(px)
+    # 5) GT disp(px) — ✅ "점"만 크게(이미지 크기 유지)
     p = out["gt_disp_px"] / f"{stem}.png"
-    _save_map(p, disp_gt_px_full, vmin=0, vmax=vmax_px, title=None,
-              cmap=cmap_disp, with_colorbar=True)
-
-    # 6) |Pred−GT| (px)
-    err = np.abs(disp_pred_px_full - disp_gt_px_full).astype(np.float32)
-    err[~np.isfinite(err)] = np.nan
-    vmax_err = max(5.0, min(20.0, vmax_px/6.0))
-    p = out["error_abs_px"] / f"{stem}.png"
-    _save_map(p, err, vmin=0, vmax=vmax_err, title=None,
-              cmap="magma", with_colorbar=True)
+    disp_gt_vis = pixelate_keep_shape(disp_gt_px_full, block=gt_viz_block)
+    save_colormap_png_with_colorbar_auto_range(
+        p,
+        disp_gt_vis / 4.0,
+        vmin=0.0,
+        # vmax=vmax_px,
+        vmax=6.0,
+        cmap_name="magma",
+        label="GT disparity (px)",
+        bg_color="#1e1e1e",
+    )
 
     # 7) entropy before (0..1)
     p = out["entropy_before"] / f"{stem}.png"
-    _save_map(p, ent_b_full, vmin=0.0, vmax=1.0, title=None,
-              cmap="magma", with_colorbar=True)
+    save_colormap_png_with_colorbar_auto_range(
+        p,
+        ent_b_full,
+        vmin=0.0,
+        vmax=1.0,
+        cmap_name="magma",
+        label="Entropy (before)",
+        bg_color="#1e1e1e",
+    )
 
     # 8) entropy after (0..1)
     p = out["entropy_after"] / f"{stem}.png"
-    _save_map(p, ent_a_full, vmin=0.0, vmax=1.0, title=None,
-              cmap="magma", with_colorbar=True)
-
-    # 9) fill mask (binary)
-    p = out["fill_mask"] / f"{stem}.png"
-    _save_map(p, mask_full.astype(np.float32), vmin=0.0, vmax=1.0, title=None,
-              cmap="gray", with_colorbar=False)
+    save_colormap_png_with_colorbar_auto_range(
+        p,
+        ent_a_full,
+        vmin=0.0,
+        vmax=1.0,
+        cmap_name="magma",
+        label="Entropy (after)",
+        bg_color="#1e1e1e",
+    )
 
     print(f"[Saved all panels for] {stem}")
 
@@ -548,7 +691,6 @@ def process_pair_and_viz(
         Rp = pad_right_bottom_to_multiple(right_pil, mult=8)
     else:
         Lp, Rp = left_pil, right_pil
-
     W, H = Lp.size
     assert (H % 8 == 0) and (W % 8 == 0), "H,W must be multiples of 8. Use --pad_to_8."
 
@@ -564,7 +706,6 @@ def process_pair_and_viz(
         # 코스트볼륨 & 엔트로피(before)
         cost_vol = build_cost_volume(featL, featR, args.max_disp)
         ent_before = build_entropy_map(cost_vol, T=args.ent_T, normalize=True)
-
         # ROI
         _, H4, W4 = cost_vol.shape
         roi_mask = build_roi_mask(
@@ -574,39 +715,55 @@ def process_pair_and_viz(
         )
 
         # Adaptive window refine (ROI∩invalid만 보정)
-        cost_vol_ref, ent_mid, refine_mask = refine_cost_for_uncertain_roi(
+        cost_vol_ref, ent_after, refine_mask = refine_cost_for_uncertain_roi(
             cost_vol, ent_before, ent_thr=args.ent_vis_thr,
             roi_mask=roi_mask, max_half=args.win_half_max, ent_T=args.ent_T
         )
-        
-        cost_vol_ref, ent_after, refine_mask = refine_cost_for_uncertain_roi(
-            cost_vol_ref, ent_mid, ent_thr=args.ent_vis_thr,
-            roi_mask=roi_mask, max_half=args.win_half_max, ent_T=args.ent_T
-        )
-        
 
-        # base/teacher disparity (cell units)
-        disp_base_cell, _   = argmax_disparity(cost_vol)        # [H4,W4] long
-        disp_teacher_cell, _ = argmax_disparity(cost_vol_ref)   # [H4,W4] long
+        # base/teacher disparity (cell units, long)
+        disp_base_cell, _    = argmax_disparity(cost_vol)      # refine 전 argmax
+        disp_teacher_cell, _ = argmax_disparity(cost_vol_ref)  # refine 후 argmax
 
     # ---- FILL: ROI∩invalid만 teacher로 덮어쓰기 ----
     fill_mask = refine_mask  # ROI ∩ invalid
-    disp_base_cell = disp_base_cell.to(torch.float32)
-    disp_teacher_cell = disp_teacher_cell.to(torch.float32)
-    disp_filled_cell = disp_base_cell.clone()
-    disp_filled_cell[fill_mask] = disp_teacher_cell[fill_mask]
 
-    # numpy로 변환
-    disp_filled_np = disp_filled_cell.cpu().numpy().astype(np.float32)
-    fill_mask_np   = fill_mask.cpu().numpy().astype(bool)
-    ent_before_np  = ent_before.cpu().numpy().astype(np.float32)
-    ent_after_np   = ent_after.cpu().numpy().astype(np.float32)
+    # (1) argmax(before) / argmax(after) 비교
+    same_argmax_mask = (disp_base_cell == disp_teacher_cell)  # [H4,W4] bool
+
+    disp_base_cell_f    = disp_base_cell.to(torch.float32)
+    disp_teacher_cell_f = disp_teacher_cell.to(torch.float32)
+
+    disp_before_cell = disp_base_cell_f.clone()
+
+    disp_filled_cell = disp_base_cell_f.clone()
+    disp_filled_cell[fill_mask] = disp_teacher_cell_f[fill_mask]
+
+    fill_mask_same = fill_mask & same_argmax_mask
+    disp_filled_same_cell = disp_base_cell_f.clone()
+    disp_filled_same_cell[fill_mask_same] = disp_teacher_cell_f[fill_mask_same]
+
+    equal_mask_cell = (disp_filled_cell == disp_filled_same_cell)
+    disp_equal_cell = torch.where(equal_mask_cell,
+                                  disp_filled_cell,
+                                  torch.zeros_like(disp_filled_cell))
+
+    disp_before_np       = disp_before_cell.cpu().numpy().astype(np.float32)
+    disp_filled_np       = disp_filled_cell.cpu().numpy().astype(np.float32)
+    disp_filled_same_np  = disp_filled_same_cell.cpu().numpy().astype(np.float32)
+    disp_equal_np        = disp_equal_cell.cpu().numpy().astype(np.float32)
+
+    fill_mask_np         = fill_mask.cpu().numpy().astype(bool)
+    fill_mask_same_np    = fill_mask_same.cpu().numpy().astype(bool)
+    equal_mask_np        = equal_mask_cell.cpu().numpy().astype(bool)
+
+    ent_before_np        = ent_before.cpu().numpy().astype(np.float32)
+    ent_after_np         = ent_after.cpu().numpy().astype(np.float32)
 
     # ---- GT depth/disp → disparity(px) ----
     depth_path = find_depth_for_left(Path(args.gt_depth_dir), stem)
     if depth_path is None:
         print(f"[Skip] GT depth not found for {stem}")
-        return
+        return None
     invalid_vals = _parse_invalid_values(args.gt_invalid_values)
     disp_gt_px = load_gt_disp_px(
         depth_path,
@@ -620,7 +777,25 @@ def process_pair_and_viz(
         max_depth_m=args.gt_max_depth_m,
     )
 
-    # ---- 개별 PNG 저장 ----
+    # ---- GT를 1/4-grid (cell units)로 다운샘플 ----
+    disp_gt_cell = downsample_disp_to_quarter_cell(disp_gt_px)  # [H4,W4]
+
+    # ---- (0) BEFORE ----
+    out_root_before = Path(args.out_dir) / "before"
+    save_cmp_panels_separate(
+        left_img_pil=Lp,
+        disp_pred_cell=disp_before_np,
+        fill_mask_q=fill_mask_np,
+        disp_gt_px_full=disp_gt_px,
+        ent_before_q=ent_before_np,
+        ent_after_q=ent_before_np,
+        max_disp_cell=args.max_disp,
+        out_root=out_root_before,
+        stem=stem,
+        gt_viz_block=args.gt_viz_block,   # ✅ GT 점 크게
+    )
+
+    # ---- (1) AFTER 기본 FILL ----
     out_root = Path(args.out_dir)
     save_cmp_panels_separate(
         left_img_pil=Lp,
@@ -631,8 +806,56 @@ def process_pair_and_viz(
         ent_after_q=ent_after_np,
         max_disp_cell=args.max_disp,
         out_root=out_root,
-        stem=stem
+        stem=stem,
+        gt_viz_block=args.gt_viz_block,   # ✅
     )
+
+    # ---- (2) AFTER + argmax same ----
+    out_root_same = Path(args.out_dir) / "argmax_same"
+    save_cmp_panels_separate(
+        left_img_pil=Lp,
+        disp_pred_cell=disp_filled_same_np,
+        fill_mask_q=fill_mask_same_np,
+        disp_gt_px_full=disp_gt_px,
+        ent_before_q=ent_before_np,
+        ent_after_q=ent_after_np,
+        max_disp_cell=args.max_disp,
+        out_root=out_root_same,
+        stem=stem,
+        gt_viz_block=args.gt_viz_block,   # ✅
+    )
+
+    # ---- (3) results ----
+    out_root_res = Path(args.out_dir) / "results"
+    save_cmp_panels_separate(
+        left_img_pil=Lp,
+        disp_pred_cell=disp_equal_np,
+        fill_mask_q=equal_mask_np,
+        disp_gt_px_full=disp_gt_px,
+        ent_before_q=ent_before_np,
+        ent_after_q=ent_after_np,
+        max_disp_cell=args.max_disp,
+        out_root=out_root_res,
+        stem=stem,
+        gt_viz_block=args.gt_viz_block,   # ✅
+    )
+
+    # ---- results (= disp_equal_np, equal_mask_np)에 대한 1/4-grid 정량 평가 ----
+    epe_res, d1_res, n_valid_res, sum_abs_res, bad_cnt_res = compute_epe_d1_quarter(
+        pred_cell=disp_equal_np,
+        gt_cell=disp_gt_cell,
+        valid_mask=equal_mask_np,
+    )
+
+    metrics = {
+        "stem": stem,
+        "epe": epe_res,
+        "d1": d1_res,
+        "valid": n_valid_res,
+        "sum_abs": sum_abs_res,
+        "bad_count": bad_cnt_res,
+    }
+    return metrics
 
 def find_right_for_left(right_dir: Path, left_stem: str) -> Optional[Path]:
     for ext in IMG_EXTS:
@@ -663,36 +886,71 @@ def pad_right_bottom_to_multiple(img_pil: Image.Image, mult: int = 8) -> Image.I
     new_img.paste(img_pil, (0, 0))
     return new_img
 
+# ===========================================
+# 7) metrics txt 저장
+# ===========================================
+def write_metrics_txt(metrics_list: List[Dict], out_dir: Path, filename: str = "results_eval_quarter.txt"):
+    if not metrics_list:
+        print("[Eval] No metrics to write.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    eval_path = out_dir / filename
+
+    total_valid = sum(m.get("valid", 0) for m in metrics_list)
+    total_sum_abs = sum(m.get("sum_abs", 0.0) for m in metrics_list)
+    total_bad = sum(m.get("bad_count", 0) for m in metrics_list)
+
+    with open(eval_path, "w") as f:
+        for m in metrics_list:
+            stem = m.get("stem", "unknown")
+            valid = m.get("valid", 0)
+            epe = m.get("epe", float("nan"))
+            d1  = m.get("d1", float("nan"))
+
+            if valid <= 0 or not np.isfinite(epe) or not np.isfinite(d1):
+                epe_str = "nan"
+                d1_str  = "nan"
+            else:
+                epe_str = f"{epe:.6f}"
+                d1_str  = f"{d1:.6f}"
+
+            f.write(f"{stem} {epe_str} {d1_str}\n")
+
+        if total_valid > 0:
+            mean_epe = total_sum_abs / total_valid
+            mean_d1  = total_bad / total_valid
+            f.write(f"mean {mean_epe:.6f} {mean_d1:.6f}\n")
+        else:
+            f.write("mean nan nan\n")
+
+    print(f"[Eval] Wrote metrics to {eval_path}")
 
 # -----------------------------
 # CLI
 # -----------------------------
 def get_args():
     p = argparse.ArgumentParser("ROI entropy fill vs GT — save panels to separate folders")
-    # 입력(단일/디렉터리)
     p.add_argument("--left",  type=str, default=None)
     p.add_argument("--right", type=str, default=None)
-    p.add_argument("--left_dir",  type=str, default="/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_left")
-    p.add_argument("--right_dir", type=str, default="/home/jaejun/dataset/MS2/sync_data/tester/rgb/img_right")
+    p.add_argument("--left_dir",  type=str, default="/home/jaejun/dataset/MS2/sync_data/tester2/thr/img_left_preprocessed")
+    p.add_argument("--right_dir", type=str, default="/home/jaejun/dataset/MS2/sync_data/tester2/thr/img_right_preprocessed")
     p.add_argument("--glob", type=str, default="*.png")
 
-    # DINO/코스트볼륨
-    p.add_argument("--max_disp", type=int, default=14, help="1/4-grid max disparity (inclusive)")
+    p.add_argument("--max_disp", type=int, default=6, help="1/4-grid max disparity (inclusive)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--pad_to_8", action="store_true")
 
-    # 엔트로피/ROI 파라미터
     p.add_argument("--ent_T", type=float, default=0.1)
     p.add_argument("--ent_vis_thr", type=float, default=0.6)
     p.add_argument("--roi_mode", type=str, default="frac", choices=["frac","abs4"])
-    p.add_argument("--roi_u0", type=float, default=0.2)
-    p.add_argument("--roi_u1", type=float, default=0.7)
-    p.add_argument("--roi_v0", type=float, default=2/3)
+    p.add_argument("--roi_u0", type=float, default=0.0)
+    p.add_argument("--roi_u1", type=float, default=1.0)
+    p.add_argument("--roi_v0", type=float, default=0.0)
     p.add_argument("--roi_v1", type=float, default=1.0)
-    p.add_argument("--win_half_max", type=int, default=12)
+    p.add_argument("--win_half_max", type=int, default=48)
 
-    # GT/캘리브
-    p.add_argument("--gt_depth_dir",  type=str, default="/home/jaejun/dataset/MS2/proj_depth/tester/rgb/depth_filtered")
+    p.add_argument("--gt_depth_dir",  type=str, default="/home/jaejun/dataset/MS2/proj_depth/tester2/thr/depth_filtered")
     p.add_argument("--gt_mode",       type=str, default="depth", choices=["depth","disp"])
     p.add_argument("--gt_depth_scale", type=float, default=256.0)
     p.add_argument("--gt_disp_scale",  type=float, default=1.0)
@@ -700,25 +958,30 @@ def get_args():
                    help="raw GT에서 무효로 볼 값들(쉼표 구분). 예: 0,65535")
     p.add_argument("--gt_max_depth_m", type=float, default=200.0,
                    help="이 값보다 큰 깊이는 무효 처리(0: 비활성)")
+    # 이거는 ms2 rgb
+    # p.add_argument("--focal_px", type=float, default=764.5138549804688)
+    # p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
+    
+    
+    # 이거는 ms2 thermal
+    p.add_argument("--focal_px", type=float, default=387.78695052)
+    p.add_argument("--baseline_m", type=float, default=0.30389951424)
+    # ✅ NEW: GT 시각화 "점" 크기(블록 크기)
+    p.add_argument("--gt_viz_block", type=int, default=4,
+                   help="GT disparity visualization pixelation block size. 1 = no pixelation.")
 
-    p.add_argument("--focal_px", type=float, default=764.5138549804688)
-    p.add_argument("--baseline_m", type=float, default=0.29918420530585865)
-
-    # 출력
-    p.add_argument("--out_dir", type=str, default="./log/out_fill_vs_gt")
-
+    p.add_argument("--out_dir", type=str, default="./log/MS2_tester_thr_image_pseudo_label_gtup")
     return p.parse_args()
+
 
 def main():
     args = get_args()
     device = torch.device(args.device)
 
-    # 모드 판별
     dir_mode = (args.left is None and args.right is None and args.left_dir and args.right_dir)
     file_mode = (args.left is not None and args.right is not None)
     assert dir_mode or file_mode, "하나를 선택: (1) --left/--right 또는 (2) --left_dir/--right_dir"
 
-    # DINO 로드
     model = load_dino(device)
 
     if file_mode:
@@ -728,10 +991,14 @@ def main():
         L = Image.open(str(lp)).convert("RGB")
         R = Image.open(str(rp)).convert("RGB")
         assert L.size == R.size, f"size mismatch: {L.size} vs {R.size}"
-        process_pair_and_viz(model, L, R, lp.stem, args)
+        metrics = process_pair_and_viz(model, L, R, lp.stem, args)
+
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if metrics is not None:
+            write_metrics_txt([metrics], out_dir)
         return
 
-    # 디렉터리 모드
     left_dir  = Path(args.left_dir);  right_dir = Path(args.right_dir)
     out_dir   = Path(args.out_dir)
     assert left_dir.is_dir() and right_dir.is_dir(), "입력 디렉터리 확인"
@@ -742,6 +1009,8 @@ def main():
     assert len(left_files) > 0, f"No files matching {args.glob} in {left_dir}"
 
     processed, skipped = 0, 0
+    metrics_list: List[Dict] = []
+
     for lp in left_files:
         rp = find_right_for_left(right_dir, lp.stem)
         if rp is None:
@@ -749,17 +1018,21 @@ def main():
         depth_path = find_depth_for_left(Path(args.gt_depth_dir), lp.stem)
         if depth_path is None:
             print(f"[Skip] gt depth not found for {lp.name}"); skipped += 1; continue
-        try:
-            L = Image.open(str(lp)).convert("RGB")
-            R = Image.open(str(rp)).convert("RGB")
-            if L.size != R.size:
-                print(f"[Skip] size mismatch: {lp.name} vs {rp.name}"); skipped += 1; continue
-            process_pair_and_viz(model, L, R, lp.stem, args)
-            processed += 1
-        except Exception as e:
-            print(f"[Error] {lp.name}: {e}")
-            skipped += 1
 
+        L = Image.open(str(lp)).convert("RGB")
+        R = Image.open(str(rp)).convert("RGB")
+        if L.size != R.size:
+            print(f"[Skip] size mismatch: {lp.name} vs {rp.name}"); skipped += 1; continue
+
+        metrics = process_pair_and_viz(model, L, R, lp.stem, args)
+        if metrics is None:
+            skipped += 1
+            continue
+
+        metrics_list.append(metrics)
+        processed += 1
+
+    write_metrics_txt(metrics_list, out_dir)
     print(f"[Done] processed={processed}, skipped={skipped}, out_dir={out_dir.resolve()}")
 
 if __name__ == "__main__":
